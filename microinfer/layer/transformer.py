@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from ..model.config import QwenConfig
+from microinfer.config import QwenConfig
 from norm import FuseLayerNorm
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from rope import comp_freq_cis, apply
@@ -45,7 +45,7 @@ class Attention(nn.Module):
         self.max_len = config.max_pos_embed
         self.rope_base = config.rope_base
 
-    def foward(self, x: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
 
         cis = comp_freq_cis(self.max_len, self.rope_base, self.head_dim)
         batch_size, seq_len, hidden_dim = x.shape

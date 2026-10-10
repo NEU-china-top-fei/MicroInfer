@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from ..model.config import QwenConfig
+from microinfer.config import QwenConfig
 
 
 class FuseLayerNorm(nn.Module):
@@ -32,7 +32,7 @@ class FuseLayerNorm(nn.Module):
         ).to(origin_dtype)
         return self.layer(normed), residual
 
-    def foward(
+    def forward(
         self, x: torch.Tensor, residual: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.is_fuse:

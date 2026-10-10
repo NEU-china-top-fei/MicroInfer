@@ -1,8 +1,7 @@
 import torch
 from torch import nn
-from config import QwenConfig
-from ..layer.norm import FuseLayerNorm
-from ..layer.transformer import TransformerLayer
+from MicroInfer.microinfer.config.config import QwenConfig
+from microinfer.layer import *
 
 
 class QwenModel(nn.modules):
@@ -22,7 +21,7 @@ class QwenModel(nn.modules):
         # TODO
         self.mid_norm = FuseLayerNorm(config)
 
-    def foward(self, x: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, position: torch.Tensor) -> torch.Tensor:
         """
         [batch_size,seq_len,vocab_size]->[batch_size,seq_len,hidden_dim]
         """
