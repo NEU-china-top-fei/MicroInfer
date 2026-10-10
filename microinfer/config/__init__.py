@@ -1,2 +1,2 @@
-from config import QwenConfig
-from samplepara import SampleParameter
+from .config import QwenConfig
+from .samplepara import SampleParameter
