@@ -11,5 +11,5 @@ python -m pytest -q
 GPU 条件和已知缺陷见 [测试开发指南](tests/README.md)。
 
 从已完成的 BlockManager 继续构建推理引擎，见
-[组件拆分、接口契约与 M01–M10 开发路线](docs/engine-roadmap.md)。
+[参考 nano-vllm 的组件拆分与 M01–M10 开发路线](docs/engine-roadmap.md)。
 新增阶段验收位于 `tests/roadmap/`；对应骨架明确抛出 `NotImplementedError`，供逐模块实现。

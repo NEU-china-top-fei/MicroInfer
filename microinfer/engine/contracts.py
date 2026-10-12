@@ -1,6 +1,7 @@
-"""CPU-only values shared by scheduler, runner and output processing.
+"""Optional CPU-only helper values for batch/reference tests and text processing.
 
-Snapshots intentionally contain no mutable Sequence references or torch tensors.
+The primary nano-vllm path passes (list[Sequence], is_prefill), NOT SchedulerOutput.
+Snapshots remain available for isolated packing and cached-model oracle tests.
 See docs/engine-roadmap.md for lifecycle and validation rules.
 """
 

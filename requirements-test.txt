@@ -2,3 +2,4 @@ pytest>=8,<10
 numpy>=1.26
 xxhash>=3
 torch>=2.8
+safetensors>=0.4

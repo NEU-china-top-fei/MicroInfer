@@ -27,7 +27,7 @@ class Sequence:
         self.is_prefill = True
         self.block_table = []
         self.temperature = sampling_params.temperature
-        self.max_tokens = sampling_params.max_tokens
+        self.max_tokens = sampling_params.max_tokens  # sample max
         self.ignore_eos = sampling_params.ignore_eos
 
     def __len__(self):

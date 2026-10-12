@@ -1,9 +1,20 @@
-"""M05 exercise: stable temperature sampling and explicit greedy mode."""
+"""M05: nano-vllm callable sampler, with optional probability/greedy helpers."""
 
 import torch
+from torch import nn
 
 
-class Sampler:
+class Sampler(nn.Module):
+    def forward(self, logits: torch.Tensor, temperatures: torch.Tensor):
+        """M05 nano-vllm entrypoint: sampler(logits, temperatures) -> int64 [N].
+
+        Convert to FP32, scale by positive temperatures, softmax and sample.
+        nano-vllm uses an exponential-race sampler; do not require its exact
+        random token sequence when validating the categorical distribution.
+        probabilities/sample below are optional testable MicroInfer helpers.
+        """
+        raise NotImplementedError("M05: Sampler.forward")
+
     def probabilities(
         self, logits: torch.Tensor, temperatures: torch.Tensor
     ) -> torch.Tensor:

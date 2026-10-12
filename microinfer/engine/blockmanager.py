@@ -126,13 +126,19 @@ class BlockManager:
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         """
+        USED FOR PREFILL
+
         carry out the true allocate on both reusable and new block
         (
             but just allocate,we don't carry out the true compute so we can't update the table immediately
             so we can only update the manager index after compute using special function
         )
+
         """
         prefix = -1
+        seq.num_cached_tokens = (
+            self.block_size * num_cached_blocks
+        )  # we need to cover previou value
         for i in range(num_cached_blocks):
             seq_block = seq.block(i)
             hash_val = self.compute_hash(seq_block, prefix)
@@ -145,7 +151,7 @@ class BlockManager:
             block = self.blocks[block_id]
             block.ref_count += 1
             seq.block_table.append(block_id)
-            seq.num_cached_tokens += self.block_size
+            # seq.num_cached_tokens += self.block_size
         for i in range(num_cached_blocks, seq.num_blocks):
             seq_block = seq.block(i)
             hash_val = self.compute_hash(seq_block, prefix)
@@ -170,9 +176,20 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
+        # we just decode a new token to find that we need another block
+
+        # means that we need to allocate new block and have free block
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        """
+        equal to 
+            need_blocks = 1 if len(seq)%block_size==1 else 0
+            return len(free_block_ids) >= need_blocks
+        """
 
     def may_append(self, seq: Sequence):
+        """
+        USED FOR DECODE
+        """
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 

@@ -1,108 +1,108 @@
 import pytest
 
 from microinfer.config import SampleParameter
-from microinfer.engine.contracts import (
-    RequestOutput,
-    ScheduledSequence,
-    SchedulerOutput,
-)
 from microinfer.engine.llm_engine import LLMEngine
+from microinfer.engine.sequence import SequenceStatus
 
-pytestmark = pytest.mark.roadmap
+pytestmark = [pytest.mark.roadmap, pytest.mark.nano]
 
 
-@pytest.mark.parametrize("fail", [False, True])
-def test_schedule_execute_commit_order(fail):
+@pytest.mark.parametrize("mode", [True, False])
+def test_step_order_finished_outputs_and_signed_token_count(sequence_cls, mode):
     events = []
-    work = SchedulerOutput((ScheduledSequence(8, (1,), 0, (0,), True),))
-    expected = [RequestOutput(8, (2,), True, "length")]
+    seq = sequence_cls([1, 2, 3])
+    if not mode:
+        seq.append_token(4)
+    seq.num_scheduled_tokens = 3 if mode else 1
+    expected = seq.completion_token_ids + [5]
 
     class SchedulerSpy:
         def schedule(self):
             events.append("schedule")
-            return work
+            return [seq], mode
 
-        def update(self, output, tokens):
-            assert output is work and tokens == {8: 2}
-            events.append("commit")
-            return expected
+        def postprocess(self, seqs, tokens, is_prefill):
+            assert seqs == [seq] and tokens == [5] and is_prefill == mode
+            events.append("postprocess")
+            seq.num_scheduled_tokens = 0
+            seq.append_token(5)
+            seq.status = SequenceStatus.FINISHED
 
     class RunnerSpy:
-        def execute(self, output):
-            assert output is work
-            events.append("execute")
-            if fail:
-                raise RuntimeError("device failure")
-            return {8: 2}
+        def run(self, seqs, is_prefill):
+            assert seqs == [seq] and is_prefill == mode
+            events.append("run")
+            return [5]
 
-    engine = LLMEngine(SchedulerSpy(), RunnerSpy())
-    if fail:
-        with pytest.raises(RuntimeError, match="device failure"):
-            engine.step()
-        assert events == ["schedule", "execute"]
-    else:
-        assert engine.step() == expected
-        assert events == ["schedule", "execute", "commit"]
+    outputs, count = LLMEngine(SchedulerSpy(), RunnerSpy()).step()
+    assert outputs == [(seq.seq_id, expected)]
+    assert count == (3 if mode else -1)
+    assert events == ["schedule", "run", "postprocess"]
 
 
-def test_idle_engine_does_not_execute_or_commit():
-    class IdleScheduler:
+def test_execution_error_does_not_postprocess(sequence_cls):
+    seq = sequence_cls([1])
+    seq.num_scheduled_tokens = 1
+
+    class SchedulerSpy:
         def schedule(self):
-            return SchedulerOutput()
+            return [seq], True
 
-        def update(self, *args):
-            pytest.fail("idle work was committed")
+        def postprocess(self, *args):
+            pytest.fail("failed KV was committed")
 
-    class IdleRunner:
-        def execute(self, *args):
-            pytest.fail("idle work was executed")
+    class RunnerSpy:
+        def run(self, *args):
+            raise RuntimeError("device failure")
 
-    assert LLMEngine(IdleScheduler(), IdleRunner()).step() == []
+    with pytest.raises(RuntimeError, match="device failure"):
+        LLMEngine(SchedulerSpy(), RunnerSpy()).step()
+
+
+def test_unfinished_sequences_produce_no_output_event(sequence_cls):
+    seq = sequence_cls([1, 2, 3])
+    seq.num_scheduled_tokens = 1
+
+    class SchedulerSpy:
+        def schedule(self):
+            return [seq], True
+
+        def postprocess(self, seqs, tokens, is_prefill):
+            seq.num_cached_tokens += 1
+            seq.num_scheduled_tokens = 0
+
+    class RunnerSpy:
+        def run(self, *args):
+            return [99]
+
+    assert LLMEngine(SchedulerSpy(), RunnerSpy()).step() == ([], 1)
 
 
 @pytest.mark.integration
-def test_bounded_generation_loop_with_real_scheduler_runner_and_sampler(
-    scheduler_factory, sequence_cls
-):
-    import torch
-    from torch import nn
-    from torch.nn import functional as F
-
-    from microinfer.layer.sampler import Sampler
-    from microinfer.runner import ModelRunner
-
-    class TokenModel(nn.Module):
-        def forward_batch(self, batch, kv_cache):
-            assert not torch.is_grad_enabled()
-            return F.one_hot((batch.input_ids + 1) % 16, 16).float()
+def test_generation_terminates_with_real_scheduler(scheduler_factory, sequence_cls):
+    # Tests lifecycle, not model numerics. Runner/model are verified separately.
+    class DeterministicRunner:
+        def run(self, seqs, is_prefill):
+            return [
+                (s.token_ids[s.num_cached_tokens + s.num_scheduled_tokens - 1] + 1) % 16
+                for s in seqs
+            ]
 
     scheduler, manager = scheduler_factory(max_num_batched_tokens=3)
-    engine = LLMEngine(
-        scheduler, ModelRunner(TokenModel(), None, Sampler(), block_size=4, greedy=True)
-    )
+    engine = LLMEngine(scheduler, DeterministicRunner())
     a = sequence_cls([1, 2, 3, 4, 5], SampleParameter(max_tokens=3))
     b = sequence_cls([9], SampleParameter(max_tokens=3))
     for seq in [a, b]:
         engine.add_request(seq)
     finished = {}
     for _ in range(16):
-        if not engine.has_unfinished_requests():
+        if engine.is_finished():
             break
-        for output in engine.step():
-            if output.finished:
-                assert output.seq_id not in finished
-                finished[output.seq_id] = output.token_ids
+        outputs, _ = engine.step()
+        for seq_id, tokens in outputs:
+            assert seq_id not in finished
+            finished[seq_id] = tokens
     else:
-        pytest.fail("generation loop made no bounded progress")
-    assert finished == {a.seq_id: (6, 7, 8), b.seq_id: (10, 11, 12)}
+        pytest.fail("generation did not terminate")
+    assert finished == {a.seq_id: [6, 7, 8], b.seq_id: [10, 11, 12]}
     assert not manager.used_block_ids
-
-
-def test_engine_abort_delegates(scheduler_factory, sequence_cls):
-    scheduler, _ = scheduler_factory()
-    engine = LLMEngine(scheduler, object())
-    seq = sequence_cls([1])
-    engine.add_request(seq)
-    assert engine.has_unfinished_requests()
-    assert engine.abort(seq.seq_id)
-    assert not engine.has_unfinished_requests()

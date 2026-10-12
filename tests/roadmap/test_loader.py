@@ -4,7 +4,7 @@ from torch import nn
 
 from microinfer.model.loader import load_weights
 
-pytestmark = pytest.mark.roadmap
+pytestmark = [pytest.mark.roadmap, pytest.mark.extension]
 
 
 def test_explicit_name_mapping_dtype_conversion_and_no_aliasing():

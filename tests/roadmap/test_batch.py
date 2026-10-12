@@ -6,10 +6,10 @@ import torch
 from microinfer.engine.contracts import ScheduledSequence, SchedulerOutput
 from microinfer.worker.batch import prepare_batch
 
-pytestmark = pytest.mark.roadmap
+pytestmark = [pytest.mark.roadmap, pytest.mark.extension]
 
 
-def test_mixed_chunk_and_decode_pack_exact_slots():
+def test_optional_packer_handles_distinct_cached_prefixes():
     a = ScheduledSequence(10, (13, 14, 15), 3, (2, 0), False)
     b = ScheduledSequence(20, (25,), 1, (5,), True, 0.5)
     snapshot = SchedulerOutput((a, b))

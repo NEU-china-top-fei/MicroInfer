@@ -1,4 +1,4 @@
-"""M02 exercise: turn a scheduler snapshot into packed model inputs."""
+"""Optional numerical-test adapter; nano-vllm Runner uses Context directly."""
 
 from dataclasses import dataclass
 
