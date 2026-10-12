@@ -60,6 +60,7 @@ class BlockManager:
         hash_fuc = xxhash.xxh64()
         if prefix != -1:
             # this has prefix
+            # update just update the internal state
             hash_fuc.update(prefix.to_bytes(8, "little"))
 
         hash_fuc.update(np.array(token_ids).tobytes())
@@ -68,48 +69,89 @@ class BlockManager:
 
     def _allocate_block(self) -> int:
         block_id = self.free_block_ids.popleft()
+        # you can not change the size of dict while iteratition
+        old_hashes = [h for h, bid in self.hash_to_block_id.items() if bid == block_id]
+
+        for h in old_hashes:
+            del self.hash_to_block_id[h]
+
         self.used_block_ids.add(block_id)
         block = self.blocks[block_id]
         block.reset()
+
         return block_id
 
     def _deallocate_block(self, block_id: int):
-        block = self.blocks[block_id]
+        """
+        keep kv and map when ref_cnt=0,only when it needs to be reused clean it
+        """
+        # block = self.blocks[block_id]
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
-        del self.hash_to_block_id[block.hash]
+        # del self.hash_to_block_id[block.hash]
 
     def can_allocate(self, seq: Sequence) -> int:
         """
-        compute how many blocks can be reused in this sequence
+        compute how many blocks can be reused in this sequence(return -1 if overflow)
+        we need to reserve the compute of last block to avoid the cached token excceed the true length
+        and deal with hash collision
         """
         num_seq_blocks = seq.num_blocks
         num_blocks_reused = 0
+        free_cache_hit = 0
         prefix = -1
-        for i in range(num_seq_blocks):
+        for i in range(num_seq_blocks - 1):
             seq_block = seq.block(i)
             hash_val = self.compute_hash(seq_block, prefix)
-            if self.hash_to_block_id.get(hash_val) is None:
+            block_id = self.hash_to_block_id.get(hash_val)
+            if block_id is None:
                 break
             else:
+                cache_block = self.blocks[block_id]
+                if cache_block.token_ids != seq_block:
+                    break
                 num_blocks_reused += 1
                 prefix = hash_val
+                if block_id in self.free_block_ids:
+                    free_cache_hit += 1
+
+        # compute whether the rest free block can hold
+        # Free cache hits must still count against free capacity
+        if (
+            seq.num_blocks - num_blocks_reused
+            > len(self.free_block_ids) - free_cache_hit
+        ):
+            return -1
         return num_blocks_reused
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         """
+        USED FOR PREFILL
+
         carry out the true allocate on both reusable and new block
+        (
+            but just allocate,we don't carry out the true compute so we can't update the table immediately
+            so we can only update the manager index after compute using special function
+        )
+
         """
         prefix = -1
+        seq.num_cached_tokens = (
+            self.block_size * num_cached_blocks
+        )  # we need to cover previou value
         for i in range(num_cached_blocks):
             seq_block = seq.block(i)
             hash_val = self.compute_hash(seq_block, prefix)
             block_id = self.hash_to_block_id.get(hash_val)
+            if block_id in self.free_block_ids:
+                # cache hit the zero ref_cnt block
+                self.free_block_ids.remove(block_id)
+                self.used_block_ids.add(block_id)
             prefix = hash_val
             block = self.blocks[block_id]
             block.ref_count += 1
             seq.block_table.append(block_id)
-            seq.num_cached_tokens += self.block_size
+            # seq.num_cached_tokens += self.block_size
         for i in range(num_cached_blocks, seq.num_blocks):
             seq_block = seq.block(i)
             hash_val = self.compute_hash(seq_block, prefix)
@@ -117,25 +159,55 @@ class BlockManager:
             new_block_id = self._allocate_block()
             new_block = self.blocks[new_block_id]
             new_block.update(hash_val, seq_block)
-            self.hash_to_block_id[hash_val] = new_block_id
+            # self.hash_to_block_id[hash_val] = new_block_id
             seq.block_table.append(new_block_id)
 
     def deallocate(self, seq: Sequence):
+        """
+        traverse the true block table
+        """
         seq.num_cached_tokens = 0
-        for i in range(seq.num_blocks):
-            block_id = seq.block_table[i]
-            self._deallocate_block(block_id)
+        for block_id in seq.block_table:
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                # allocate and deallocate both should maintain reference count
+                self._deallocate_block(block_id)
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
+        # we just decode a new token to find that we need another block
+
+        # means that we need to allocate new block and have free block
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        """
+        equal to 
+            need_blocks = 1 if len(seq)%block_size==1 else 0
+            return len(free_block_ids) >= need_blocks
+        """
 
     def may_append(self, seq: Sequence):
+        """
+        USED FOR DECODE
+        """
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 
-    # def hash_blocks(self, seq: Sequence):
-    #     """
-    #     hash the block of this sequence after cached blocks
-    #     """
-    #     start_block_id = seq.block_table[-1] if len(seq.block_table) != 0 else -1
+    def hash_blocks(self, seq: Sequence):
+        """
+        hash the block of this sequence after cached blocks (after some num of token be scheduled)
+        """
+        # start_block_id = seq.block_table[-1] if len(seq.block_table) != 0 else -1
+        # can be the situation that a scheduled token can't fit in a block
+        start = seq.num_cached_tokens // self.block_size
+        end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
+        prefix = self.blocks[seq.block_table[start - 1]].hash if start != 0 else -1
+        for i in range(start, end):
+            block = seq.block(i)
+            hash_val = self.compute_hash(block, prefix)
+            prefix = hash_val
+            block_id = seq.block_table[i]
+            self.hash_to_block_id[hash_val] = block_id
+            self.blocks[block_id].update(
+                hash_val, block
+            )  # update because the block maybe unfilled

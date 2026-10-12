@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from MicroInfer.microinfer.config.config import QwenConfig
+from microinfer.config import QwenConfig
 from microinfer.layer import *
 
 
@@ -36,3 +36,12 @@ class QwenModel(nn.modules):
         [batch_size,seq_len,hidden_dim]->[batch_size,seq_len,vocab_size]
         """
         return self.out_logits(x)
+
+    def forward_batch(self, batch, kv_cache) -> torch.Tensor:
+        """M07: packed cached forward, returns logits [query_tokens, vocab_size].
+
+        Use batch.positions for RoPE. At every layer write this step's K/V to
+        batch.slot_mapping, then read paged context with the M04 backend.
+        Keep the existing dense forward API for standalone layer development.
+        """
+        raise NotImplementedError("M07: QwenModel.forward_batch")
