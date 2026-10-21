@@ -4,7 +4,7 @@ from microinfer.config import SampleParameter
 from microinfer.engine.llm_engine import LLMEngine
 from microinfer.engine.sequence import SequenceStatus
 
-pytestmark = [pytest.mark.roadmap, pytest.mark.nano]
+pytestmark = [pytest.mark.component, pytest.mark.nano]
 
 
 @pytest.mark.parametrize("mode", [True, False])

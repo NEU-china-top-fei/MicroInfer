@@ -6,7 +6,7 @@ from torch import nn
 
 from microinfer.model.loader import load_model
 
-pytestmark = [pytest.mark.roadmap, pytest.mark.nano]
+pytestmark = [pytest.mark.component, pytest.mark.nano]
 
 
 def test_load_local_safetensors_without_replacing_parameter(tmp_path):

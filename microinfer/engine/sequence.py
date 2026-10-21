@@ -15,7 +15,10 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params=SampleParameter()):
+    def __init__(self, token_ids: list[int], sampling_params=None):
+        sampling_params = sampling_params or SampleParameter()
+        if not token_ids or any(type(t) is not int or t < 0 for t in token_ids):
+            raise ValueError("token_ids must be nonempty nonnegative integers")
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
@@ -29,6 +32,7 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens  # sample max
         self.ignore_eos = sampling_params.ignore_eos
+        self.greedy = sampling_params.greedy
 
     def __len__(self):
         return self.num_tokens

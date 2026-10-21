@@ -14,7 +14,10 @@ def main():
     project = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--reference-root", type=Path, default=project.parents[1] / "nano-vllm"
+        "--reference-root",
+        type=Path,
+        required=True,
+        help="path to a local nano-vllm checkout",
     )
     args, pytest_args = parser.parse_known_args()
     sys.path.insert(0, str(project))
@@ -23,6 +26,8 @@ def main():
     import microinfer.engine.scheduler as target
 
     source_path = args.reference_root / "nanovllm/engine/scheduler.py"
+    if not source_path.is_file():
+        parser.error(f"Scheduler source not found: {source_path}")
     source = source_path.read_text()
     adaptations = {
         "from nanovllm.config import Config": "from types import SimpleNamespace as Config",
@@ -54,7 +59,7 @@ def main():
     print(f"Reference scheduler: {source_path}")
     return pytest.main(
         [
-            str(project / "tests/roadmap/test_scheduler.py"),
+            str(project / "tests/components/test_scheduler.py"),
             "-m",
             "nano and not extension",
             "-q",

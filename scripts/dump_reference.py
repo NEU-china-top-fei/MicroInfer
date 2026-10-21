@@ -11,6 +11,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--output-dir", type=Path, default=Path("results/reference"))
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -32,7 +33,7 @@ def main():
     with torch.inference_mode():
         output = model(ids, use_cache=False, output_hidden_states=True)
         embedding = model.get_input_embeddings()(ids)
-    out_dir = Path("results/reference")
+    out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     torch.save(
         {

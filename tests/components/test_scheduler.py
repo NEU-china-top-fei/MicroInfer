@@ -5,7 +5,7 @@ import pytest
 from microinfer.config import SampleParameter
 from microinfer.engine.sequence import SequenceStatus
 
-pytestmark = [pytest.mark.roadmap, pytest.mark.nano]
+pytestmark = [pytest.mark.component, pytest.mark.nano]
 
 
 def test_empty_scheduler_is_finished(scheduler_factory):
@@ -41,7 +41,6 @@ def test_chunked_prefill_discards_intermediate_sample(scheduler_factory, sequenc
     assert manager.compute_hash([1, 2, 3, 4]) in manager.hash_to_block_id
     seqs, mode = scheduler.schedule()
     assert mode is False and seq.num_scheduled_tokens == 1
-    # breakpoint()
     scheduler.postprocess(seqs, [7], mode)
     assert seq.is_finished and seq.completion_token_ids == [6, 7]
     assert not manager.used_block_ids and scheduler.is_finished()
@@ -105,12 +104,10 @@ def test_completed_prefix_reused(scheduler_factory, sequence_cls):
     a = sequence_cls([1, 2, 3, 4, 5], SampleParameter(max_tokens=1))
     scheduler.add(a)
     seqs, mode = scheduler.schedule()
-    # breakpoint()
     old_block = a.block_table[0]
     scheduler.postprocess(seqs, [9], mode)
     b = sequence_cls([1, 2, 3, 4, 6])
     scheduler.add(b)
-    # breakpoint()
     seqs, mode = scheduler.schedule()
     assert mode and seqs == [b]
     assert b.num_cached_tokens == 4 and b.num_scheduled_tokens == 1

@@ -12,9 +12,6 @@ def test_frequency_table_shape_and_zero_position():
     torch.testing.assert_close(freq.abs(), torch.ones(7, 4))
 
 
-@pytest.mark.known_bug(
-    reason="RoPE needs inverse frequencies with head_dim as denominator"
-)
 def test_frequencies_match_independent_formula():
     dim, length, base = 8, 7, 10000.0
     freq = comp_freq_cis(length, base, dim)
@@ -25,14 +22,12 @@ def test_frequencies_match_independent_formula():
             torch.testing.assert_close(freq[position, pair], expected)
 
 
-@pytest.mark.known_bug(reason="Changing cache length must not change RoPE angles")
 def test_frequency_prefix_is_independent_of_table_length():
     short = comp_freq_cis(4, 10000.0, 8)
     long = comp_freq_cis(16, 10000.0, 8)
     torch.testing.assert_close(short, long[:4])
 
 
-@pytest.mark.known_bug(reason="apply uses shape(...) and flattens the head dimension")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_rotation_matches_real_pair_formula(seeded_torch, device, dtype):
     # Current public apply contract uses adjacent real/imaginary pairs.

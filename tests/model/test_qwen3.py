@@ -1,12 +1,6 @@
-import importlib.util
-
 import pytest
 import torch
 from torch import nn
-
-pytestmark = pytest.mark.known_bug(
-    reason="QwenModel module base, initialization, layer iteration and output contract are incomplete"
-)
 
 
 def test_model_constructs_registered_layers(tiny_config):
@@ -71,8 +65,6 @@ def test_model_passes_positions_and_accumulates_final_residual(tiny_config):
 def test_real_model_prefill_is_causal(tiny_config, seeded_torch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA device is not available")
-    if importlib.util.find_spec("flash_attn") is None:
-        pytest.skip("FlashAttention is not installed")
     from microinfer.model.qwen3 import QwenModel
 
     tiny_config.rope_base = 10000.0

@@ -1,7 +1,8 @@
-from microinfer.config import SampleParameter
-import xxhash
 from collections import deque
+
 import numpy as np
+import xxhash
+
 from microinfer.engine.sequence import Sequence
 
 """
@@ -23,7 +24,6 @@ blockmanager<---------->sequence
 
 
 class Block:
-
     def __init__(self, block_id):
         self.block_id = block_id
         self.ref_count = 0
@@ -44,11 +44,16 @@ class Block:
 
 
 class BlockManager:
-
     def __init__(self, num_blocks: int, block_size: int):
+        if (
+            type(num_blocks) is not int
+            or type(block_size) is not int
+            or min(num_blocks, block_size) <= 0
+        ):
+            raise ValueError("num_blocks and block_size must be positive integers")
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_id: dict[int, int] = dict()
+        self.hash_to_block_id: dict[int, int] = {}
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
 
@@ -176,21 +181,12 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
-        # we just decode a new token to find that we need another block
-
-        # means that we need to allocate new block and have free block
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
-        """
-        equal to 
-            need_blocks = 1 if len(seq)%block_size==1 else 0
-            return len(free_block_ids) >= need_blocks
-        """
+        return len(self.free_block_ids) >= max(0, seq.num_blocks - len(seq.block_table))
 
     def may_append(self, seq: Sequence):
-        """
-        USED FOR DECODE
-        """
-        if len(seq) % self.block_size == 1:
+        if not self.can_append(seq):
+            raise ValueError("insufficient cache blocks")
+        while len(seq.block_table) < seq.num_blocks:
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence):

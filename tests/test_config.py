@@ -25,6 +25,5 @@ def test_sampling_rejects_unsupported_temperature(temperature):
         SampleParameter(temperature=temperature)
 
 
-@pytest.mark.known_bug(reason="Attention consumes rope_base but QwenConfig omits it")
 def test_config_supplies_attention_rope_base():
     assert QwenConfig().rope_base > 0

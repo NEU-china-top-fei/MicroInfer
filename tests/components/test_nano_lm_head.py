@@ -3,7 +3,7 @@ import torch
 
 from microinfer.utils.context import reset_context, set_context
 
-pytestmark = [pytest.mark.roadmap, pytest.mark.nano]
+pytestmark = [pytest.mark.component, pytest.mark.nano]
 
 
 @pytest.mark.parametrize("is_prefill", [True, False])

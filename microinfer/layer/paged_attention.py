@@ -22,20 +22,29 @@ def _paged_attention_reference(
     *,
     scale: float,
 ) -> torch.Tensor:
-    total_query, num_query_head, head_dim = query.shape
-    num_blocks, block_size, num_kv_head, _ = key_cache.shape
+    _total_query, num_query_head, head_dim = query.shape
+    _num_blocks, block_size, num_kv_head, _ = key_cache.shape
     num_request = block_tables.shape[0]
     result = torch.zeros_like(query)
+    # Half-precision QK can overflow before softmax. Keep both contractions and
+    # masking in one accumulation dtype, then restore the activation dtype.
+    accumulation_dtype = (
+        torch.float32 if query.dtype in (torch.float16, torch.bfloat16) else query.dtype
+    )
     for request_idx in range(num_request):
         context_len = context_lens[request_idx]
         block_num = (context_len + block_size - 1) // block_size
         blocks = block_tables[request_idx, :block_num]  # physical block id
         keys = key_cache[blocks].reshape(-1, num_kv_head, head_dim)[:context_len]
         values = value_cache[blocks].reshape(-1, num_kv_head, head_dim)[:context_len]
+        keys = keys.to(accumulation_dtype)
+        values = values.to(accumulation_dtype)
         start = cu_seqlens_q[request_idx]
         end = cu_seqlens_q[request_idx + 1]
-        cur_query = query[start:end].reshape(
-            -1, num_kv_head, num_query_head // num_kv_head, head_dim
+        cur_query = (
+            query[start:end]
+            .to(accumulation_dtype)
+            .reshape(-1, num_kv_head, num_query_head // num_kv_head, head_dim)
         )
         score = torch.einsum("qhgd,khd->hgqk", cur_query, keys)
         prefix_len = context_len - (end - start)
@@ -43,12 +52,10 @@ def _paged_attention_reference(
         # start means the start idx in query vector,there we need position idx in seq
         kposition = torch.arange(context_len, device=query.device)
         truth_table = qposition.unsqueeze(1) >= kposition.unsqueeze(0)
-        causal = torch.zeros_like(truth_table).where(truth_table, float("-inf"))
-        out = torch.einsum(
-            "hgqk,khd->qhgd", torch.softmax(score * scale + causal, dim=-1), values
-        )
+        scores = (score * scale).masked_fill(~truth_table, float("-inf"))
+        out = torch.einsum("hgqk,khd->qhgd", torch.softmax(scores, dim=-1), values)
 
-        result[start:end] = out.reshape(-1, num_query_head, head_dim)
+        result[start:end] = out.reshape(-1, num_query_head, head_dim).to(query.dtype)
 
     return result
 
@@ -94,20 +101,16 @@ def paged_attention(
         raise ValueError("query must have shape [T, Hq, D]")
 
     if key_cache.ndim != 4:
-        raise ValueError(
-            "key_cache must have shape " "[num_blocks, block_size, Hkv, D]"
-        )
+        raise ValueError("key_cache must have shape [num_blocks, block_size, Hkv, D]")
 
     if value_cache.ndim != 4:
-        raise ValueError(
-            "value_cache must have shape " "[num_blocks, block_size, Hkv, D]"
-        )
+        raise ValueError("value_cache must have shape [num_blocks, block_size, Hkv, D]")
 
     if key_cache.shape != value_cache.shape:
         raise ValueError("key_cache and value_cache must have the same shape")
 
     if block_tables.ndim != 2:
-        raise ValueError("block_tables must have shape " "[num_requests, max_blocks]")
+        raise ValueError("block_tables must have shape [num_requests, max_blocks]")
 
     if context_lens.ndim != 1:
         raise ValueError("context_lens must be 1-D")
@@ -179,9 +182,7 @@ def paged_attention(
         raise ValueError("number of KV heads must be positive")
 
     if num_q_heads % num_kv_heads != 0:
-        raise ValueError(
-            f"Hq={num_q_heads} must be divisible by " f"Hkv={num_kv_heads}"
-        )
+        raise ValueError(f"Hq={num_q_heads} must be divisible by Hkv={num_kv_heads}")
 
     if block_size <= 0:
         raise ValueError("block_size must be positive")
@@ -191,7 +192,7 @@ def paged_attention(
     # ============================================================
 
     if block_tables.shape[0] != num_requests:
-        raise ValueError("block_tables.shape[0] must equal " "context_lens.numel()")
+        raise ValueError("block_tables.shape[0] must equal context_lens.numel()")
 
     if cu_seqlens_q.numel() != num_requests + 1:
         raise ValueError("cu_seqlens_q must contain num_requests + 1 entries")
@@ -222,8 +223,7 @@ def paged_attention(
 
         if query_len > context_len:
             raise ValueError(
-                f"request {i}: query_len={query_len} exceeds "
-                f"context_len={context_len}"
+                f"request {i}: query_len={query_len} exceeds context_len={context_len}"
             )
 
         q_lens.append(query_len)
@@ -249,7 +249,7 @@ def paged_attention(
 
                 if block_id < 0:
                     raise ValueError(
-                        f"request {i}: invalid negative " f"block id {block_id}"
+                        f"request {i}: invalid negative block id {block_id}"
                     )
 
                 if block_id >= num_physical_blocks:
@@ -272,15 +272,7 @@ def paged_attention(
     # Decide whether FlashAttention can actually be used
     # ============================================================
 
-    #
-    # Your tests intentionally violate these constraints:
-    #
-    #   block_size = 2
-    #   head_dim   = 4
-    #   sometimes CPU
-    #
-    # so they correctly exercise the reference path.
-    #
+    # Small blocks/heads and CPU inputs use the reference implementation.
     can_use_flash = (
         flash_attn_varlen_func is not None
         and flash_attn_with_kvcache is not None

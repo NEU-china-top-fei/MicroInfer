@@ -6,7 +6,7 @@ import torch
 from microinfer.engine.contracts import ScheduledSequence, SchedulerOutput
 from microinfer.worker.batch import prepare_batch
 
-pytestmark = [pytest.mark.roadmap, pytest.mark.extension]
+pytestmark = [pytest.mark.component, pytest.mark.extension]
 
 
 def test_optional_packer_handles_distinct_cached_prefixes():

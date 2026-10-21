@@ -1,5 +1,3 @@
-import importlib.util
-
 import pytest
 import torch
 from torch.nn import functional as F
@@ -9,8 +7,7 @@ from microinfer.layer.transformer import Attention
 
 @pytest.fixture
 def attention_config(tiny_config):
-    # Supply the missing config field so layout tests can isolate Attention.
-    # The production default contract is separately tested in test_config.py.
+    # Fix the RoPE base for numerical comparisons; defaults are tested separately.
     tiny_config.rope_base = 10000.0
     return tiny_config
 
@@ -22,7 +19,6 @@ def test_qkv_projection_dimensions(attention_config):
     assert layer.v_proj.weight.shape == (8, 16)
 
 
-@pytest.mark.known_bug(reason="Output projection consumes query heads, not KV heads")
 def test_gqa_output_projection_uses_query_width(attention_config):
     layer = Attention(attention_config)
     assert (
@@ -31,7 +27,6 @@ def test_gqa_output_projection_uses_query_width(attention_config):
     )
 
 
-@pytest.mark.known_bug(reason="Q/K RMSNorm must normalize head_dim, not hidden_dim")
 def test_qk_norm_operates_per_head(attention_config):
     layer = Attention(attention_config)
     q = torch.randn(2, 3, attention_config.num_q_head, attention_config.head_dim)
@@ -45,7 +40,7 @@ def test_qk_norm_operates_per_head(attention_config):
 
 
 def attention_reference(layer, x, positions, config):
-    """Independent FP32 causal GQA with the current adjacent-pair RoPE layout."""
+    """Independent FP32 causal GQA with the Qwen split-half RoPE layout."""
     batch, length, _ = x.shape
 
     def project(proj, heads):
@@ -65,10 +60,10 @@ def attention_reference(layer, x, positions, config):
             / config.head_dim
         )
         cosine, sine = angles.cos()[None, :, None], angles.sin()[None, :, None]
-        even, odd = tensor[..., 0::2], tensor[..., 1::2]
-        return torch.stack(
-            (even * cosine - odd * sine, even * sine + odd * cosine), -1
-        ).flatten(-2)
+        first, second = tensor.chunk(2, dim=-1)
+        return torch.cat(
+            (first * cosine - second * sine, second * cosine + first * sine), dim=-1
+        )
 
     q = norm_rotate(project(layer.q_proj, config.num_q_head)).transpose(1, 2)
     k = norm_rotate(project(layer.k_proj, config.num_kv_head))
@@ -89,14 +84,9 @@ def attention_reference(layer, x, positions, config):
 
 @pytest.mark.cuda
 @pytest.mark.integration
-@pytest.mark.known_bug(
-    reason="Attention forward lacks working RoPE, QK normalization and varlen arguments"
-)
 def test_attention_matches_causal_gqa_reference(attention_config):
     if not torch.cuda.is_available():
         pytest.skip("CUDA device is not available")
-    if importlib.util.find_spec("flash_attn") is None:
-        pytest.skip("FlashAttention is not installed")
     config = attention_config
     config.head_dim, config.hidden_dim = 32, 128
     layer = Attention(config).to(device="cuda", dtype=torch.float16).eval()

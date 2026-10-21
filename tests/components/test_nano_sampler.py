@@ -3,7 +3,7 @@ import torch
 
 from microinfer.layer.sampler import Sampler
 
-pytestmark = [pytest.mark.roadmap, pytest.mark.nano]
+pytestmark = [pytest.mark.component, pytest.mark.nano]
 
 
 def test_callable_sampler_returns_one_id_per_row():

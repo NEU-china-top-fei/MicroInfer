@@ -1,42 +1,23 @@
+"""RMS normalization with an explicit residual accumulator."""
+
 import torch
 from torch import nn
-from microinfer.config import QwenConfig
 
 
 class FuseLayerNorm(nn.Module):
-    """
-    Layernorm implementation,can choose to use fuse with addition
-    """
-
-    def __init__(self, config: QwenConfig):
+    def __init__(self, config):
         super().__init__()
-        self.is_fuse = config.fused_layer_norm
-        self.hidden_dim = config.hidden_dim
         self.eps = config.norm_eps
-        if self.is_fuse:
-            self.layer = nn.Parameter(torch.ones_like(self.hidden_dim))
-        else:
-            self.norm = nn.RMSNorm(self.hidden_dim, self.eps)
+        self.is_fuse = config.fused_layer_norm
+        self.norm = nn.RMSNorm(config.hidden_dim, eps=self.eps)
 
-    @torch.compile
-    def fwd_fuse_tobe_compile(
-        self, x: torch.Tensor, residual: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # convert to fp32
-        origin_dtype = x.dtype
-        x_input = x.float() + residual.float()
-        residual = x
+    def fwd_fuse_tobe_compile(self, x, residual=None):
+        # Add in FP32, normalize before rounding back to the activation dtype.
+        combined = x.float() if residual is None else x.float() + residual.float()
+        normalized = combined * torch.rsqrt(
+            combined.square().mean(-1, keepdim=True) + self.eps
+        )
+        return normalized.to(x.dtype) * self.norm.weight, combined.to(x.dtype)
 
-        normed = x_input * torch.rsqrt(
-            x_input.pow(2).sum(dim=-1, keepdim=True) + self.eps
-        ).to(origin_dtype)
-        return self.layer(normed), residual
-
-    def forward(
-        self, x: torch.Tensor, residual: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not self.is_fuse:
-            x_input = x + residual if residual is not None else x
-            return self.norm(x_input), x
-        else:
-            return self.fwd_fuse_tobe_compile(x, residual)
+    def forward(self, x, residual=None):
+        return self.fwd_fuse_tobe_compile(x, residual)

@@ -4,7 +4,7 @@ from microinfer.config import SampleParameter
 from microinfer.engine.contracts import TextOutput
 from microinfer.llm import LLM
 
-pytestmark = [pytest.mark.roadmap, pytest.mark.nano]
+pytestmark = [pytest.mark.component, pytest.mark.nano]
 
 
 @pytest.fixture

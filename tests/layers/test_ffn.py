@@ -12,9 +12,6 @@ def test_ffn_projection_dimensions(tiny_config):
     assert layer.down_project.weight.shape == (16, 24)
 
 
-@pytest.mark.known_bug(
-    reason="Qwen3 MLP projections must be bias-free for checkpoint compatibility"
-)
 def test_qwen_ffn_has_no_projection_bias(tiny_config):
     layer = FFN(tiny_config)
     assert all(
@@ -23,7 +20,6 @@ def test_qwen_ffn_has_no_projection_bias(tiny_config):
     )
 
 
-@pytest.mark.known_bug(reason="FFN defines foward; SwiGLU must activate gate_project")
 @pytest.mark.parametrize("shape", [(3, 16), (2, 3, 16)])
 def test_ffn_matches_swiglu_formula(tiny_config, seeded_torch, device, shape):
     layer = FFN(tiny_config).to(device)

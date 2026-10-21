@@ -3,7 +3,7 @@ import torch
 
 from microinfer.worker.kv_cache import KVCache
 
-pytestmark = pytest.mark.roadmap
+pytestmark = pytest.mark.component
 
 
 def test_layout_byte_budget_and_noncontiguous_roundtrip():

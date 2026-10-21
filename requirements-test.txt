@@ -3,3 +3,5 @@ numpy>=1.26
 xxhash>=3
 torch>=2.8
 safetensors>=0.4
+transformers>=4.51,<6
+tqdm>=4.66

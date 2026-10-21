@@ -6,7 +6,7 @@ from torch.nn import functional as F
 from microinfer.runner import ModelRunner
 from microinfer.utils.context import get_context, reset_context
 
-pytestmark = [pytest.mark.roadmap, pytest.mark.nano]
+pytestmark = [pytest.mark.component, pytest.mark.nano]
 
 
 @pytest.fixture(autouse=True)

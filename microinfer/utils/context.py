@@ -1,14 +1,13 @@
-"""Per-call attention metadata, following nano-vllm utils/context.py.
+"""Per-execution metadata, isolated with ContextVar and scoped restoration."""
 
-Single-process, synchronous MVP only; this global is not a concurrent engine API.
-"""
-
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 import torch
 
 
-@dataclass(slots=True)
+@dataclass(frozen=True, slots=True)
 class Context:
     is_prefill: bool = False
     cu_seqlens_q: torch.Tensor | None = None
@@ -20,11 +19,12 @@ class Context:
     block_tables: torch.Tensor | None = None
 
 
-_CONTEXT = Context()
+_EMPTY = Context()
+_CONTEXT = ContextVar("microinfer_context", default=_EMPTY)
 
 
 def get_context():
-    return _CONTEXT
+    return _CONTEXT.get()
 
 
 def set_context(
@@ -37,19 +37,28 @@ def set_context(
     context_lens=None,
     block_tables=None,
 ):
-    global _CONTEXT
-    _CONTEXT = Context(
-        is_prefill,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        slot_mapping,
-        context_lens,
-        block_tables,
+    _CONTEXT.set(
+        Context(
+            is_prefill,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping,
+            context_lens,
+            block_tables,
+        )
     )
 
 
 def reset_context():
-    global _CONTEXT
-    _CONTEXT = Context()
+    _CONTEXT.set(Context())
+
+
+@contextmanager
+def use_context(context):
+    token = _CONTEXT.set(context)
+    try:
+        yield context
+    finally:
+        _CONTEXT.reset(token)

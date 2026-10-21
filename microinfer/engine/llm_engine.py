@@ -1,31 +1,37 @@
-"""M09: nano-vllm synchronous schedule/run/postprocess iteration.
-
-Dependency injection avoids requiring a GPU/model directory for unit tests.
-"""
+from microinfer.engine.sequence import SequenceStatus
 
 
 class LLMEngine:
     def __init__(self, scheduler, runner):
-        self.scheduler = scheduler
-        self.model_runner = runner
+        self.scheduler, self.model_runner = scheduler, runner
 
     def add_request(self, seq):
-        """Internal tokenized admission seam; the frontend handles text inputs."""
-        raise NotImplementedError("M09: LLMEngine.add_request")
+        self.scheduler.add(seq)
 
     def is_finished(self):
-        raise NotImplementedError("M09: LLMEngine.is_finished")
+        return self.scheduler.is_finished()
 
     def step(self):
-        """seqs, mode = schedule(); tokens = runner.run(seqs, mode);
-        scheduler.postprocess(seqs, tokens, mode).
-        Return ([(finished_seq_id, completion_token_ids), ...], num_tokens).
-        Compute num_tokens BEFORE postprocess clears scheduled counts:
-        positive sum(num_scheduled_tokens) for prefill; -len(seqs) for decode.
-        No partial completion events. Do not postprocess failed execution.
-        """
-        raise NotImplementedError("M09: LLMEngine.step")
+        seqs, prefill = self.scheduler.schedule()
+        if not seqs:
+            return [], 0
+        num_tokens = (
+            sum(s.num_scheduled_tokens for s in seqs) if prefill else -len(seqs)
+        )
+        try:
+            tokens = self.model_runner.run(seqs, prefill)
+        except Exception:
+            # KV may have been partially written. Abort before publishing hashes.
+            if hasattr(self.scheduler, "abort"):
+                for seq in seqs:
+                    self.scheduler.abort(seq.seq_id)
+            raise
+        self.scheduler.postprocess(seqs, tokens, prefill)
+        return [
+            (s.seq_id, s.completion_token_ids)
+            for s in seqs
+            if s.status == SequenceStatus.FINISHED
+        ], num_tokens
 
     def abort(self, seq_id):
-        """Optional extension, not nano-vllm's core API."""
-        raise NotImplementedError("extension: LLMEngine.abort")
+        return self.scheduler.abort(seq_id)

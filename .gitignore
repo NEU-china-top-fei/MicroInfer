@@ -195,3 +195,15 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Private handoff notes, local models, and generated validation artifacts
+/.local/
+/models/
+/checkpoints/
+/results/
+/scripts/results/
+*.safetensors
+*.pth
+*.ckpt
+.env.*
+!.env.example

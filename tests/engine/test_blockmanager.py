@@ -214,7 +214,6 @@ def test_chunked_prefill_then_prefix_reuse(sequence_cls):
     manager = BlockManager(5, 4)
     seq = sequence_cls(list(range(9)))
     manager.allocate(seq, 0)
-    # breakpoint()
     for chunk in [3, 2, 4]:
         seq.num_scheduled_tokens = chunk
         manager.hash_blocks(seq)

@@ -2,10 +2,11 @@ import pytest
 import torch
 
 from microinfer.engine.contracts import ScheduledSequence, SchedulerOutput
+from microinfer.runner import ModelRunner
 from microinfer.worker.batch import prepare_batch
 from microinfer.worker.kv_cache import KVCache
 
-pytestmark = [pytest.mark.roadmap, pytest.mark.integration]
+pytestmark = [pytest.mark.component, pytest.mark.integration]
 
 
 @pytest.fixture
@@ -30,6 +31,12 @@ def model_and_cache(tiny_config, seeded_torch):
     return build
 
 
+def run_cached(model, batch, cache):
+    # Binding is a runner/setup concern, never a model.forward argument.
+    ModelRunner(model, cache, None, block_size=cache.block_size)
+    return model.forward_batch(batch)
+
+
 def packed(tokens, start, blocks, seq_id=1):
     return ScheduledSequence(seq_id, tuple(tokens), start, tuple(blocks), True)
 
@@ -39,14 +46,16 @@ def test_full_prefill_equals_chunked_prefill_and_decode(model_and_cache, chunks)
     model, new_cache = model_and_cache()
     tokens = [1, 2, 3, 4, 5]
     with torch.inference_mode():
-        full = model.forward_batch(
-            prepare_batch(SchedulerOutput((packed(tokens, 0, [2, 0]),)), 4), new_cache()
+        full = run_cached(
+            model,
+            prepare_batch(SchedulerOutput((packed(tokens, 0, [2, 0]),)), 4),
+            new_cache(),
         )
         cache, pieces, start = new_cache(), [], 0
         for count in chunks:
             item = packed(tokens[start : start + count], start, [2, 0])
             pieces.append(
-                model.forward_batch(prepare_batch(SchedulerOutput((item,)), 4), cache)
+                run_cached(model, prepare_batch(SchedulerOutput((item,)), 4), cache)
             )
             start += count
     assert full.shape == (5, 32)
@@ -57,11 +66,11 @@ def test_packed_requests_match_individual_execution(model_and_cache):
     model, new_cache = model_and_cache()
     a, b = packed([1, 2, 3], 0, [2], 1), packed([7, 8], 0, [0], 2)
     with torch.inference_mode():
-        combined = model.forward_batch(
-            prepare_batch(SchedulerOutput((a, b)), 4), new_cache()
+        combined = run_cached(
+            model, prepare_batch(SchedulerOutput((a, b)), 4), new_cache()
         )
         separate = [
-            model.forward_batch(prepare_batch(SchedulerOutput((item,)), 4), new_cache())
+            run_cached(model, prepare_batch(SchedulerOutput((item,)), 4), new_cache())
             for item in [a, b]
         ]
     torch.testing.assert_close(combined, torch.cat(separate), atol=1e-5, rtol=1e-4)
@@ -71,7 +80,8 @@ def test_shared_full_prefix_is_read_only_and_matches_recomputation(model_and_cac
     model, new_cache = model_and_cache()
     cache = new_cache()
     with torch.inference_mode():
-        model.forward_batch(
+        run_cached(
+            model,
             prepare_batch(SchedulerOutput((packed([1, 2, 3, 4, 5], 0, [2, 0]),)), 4),
             cache,
         )
@@ -79,10 +89,13 @@ def test_shared_full_prefix_is_read_only_and_matches_recomputation(model_and_cac
             cache.keys[:, 2].clone(),
             cache.values[:, 2].clone(),
         )
-        reuse = model.forward_batch(
-            prepare_batch(SchedulerOutput((packed([6], 4, [2, 1], 2),)), 4), cache
+        reuse = run_cached(
+            model,
+            prepare_batch(SchedulerOutput((packed([6], 4, [2, 1], 2),)), 4),
+            cache,
         )
-        fresh = model.forward_batch(
+        fresh = run_cached(
+            model,
             prepare_batch(SchedulerOutput((packed([1, 2, 3, 4, 6], 0, [2, 1], 2),)), 4),
             new_cache(),
         )

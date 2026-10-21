@@ -1,4 +1,3 @@
-import pytest
 import torch
 from torch import nn
 
@@ -16,11 +15,8 @@ class DoubleFFN(nn.Module):
         return x * 2
 
 
-@pytest.mark.known_bug(
-    reason="TransformerLayer defines foward and residual accumulation is incomplete"
-)
 def test_transformer_wires_positions_and_residuals(tiny_config, seeded_torch):
-    # Isolate orchestration from FlashAttention and the unfinished FFN.
+    # Isolate residual orchestration from the attention and FFN kernels.
     tiny_config.rope_base = 10000.0
     layer = TransformerLayer(tiny_config)
     layer.attention, layer.ffn = PositionAttention(), DoubleFFN()

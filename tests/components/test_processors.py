@@ -4,7 +4,7 @@ from microinfer.config import SampleParameter
 from microinfer.engine.contracts import RequestOutput
 from microinfer.engine.processor import InputProcessor, OutputProcessor
 
-pytestmark = [pytest.mark.roadmap, pytest.mark.extension]
+pytestmark = [pytest.mark.component, pytest.mark.extension]
 
 
 class Tokenizer:

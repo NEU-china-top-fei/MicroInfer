@@ -10,10 +10,11 @@ import torch
 from microinfer.config import QwenConfig
 from microinfer.engine.contracts import ScheduledSequence, SchedulerOutput
 from microinfer.model.loader import load_weights
+from microinfer.runner import ModelRunner
 from microinfer.worker.batch import prepare_batch
 from microinfer.worker.kv_cache import KVCache
 
-pytestmark = [pytest.mark.roadmap, pytest.mark.integration]
+pytestmark = [pytest.mark.component, pytest.mark.integration]
 
 
 def test_real_checkpoint_logits_against_offline_reference():
@@ -55,8 +56,9 @@ def test_real_checkpoint_logits_against_offline_reference():
         ),
         block_size,
     )
+    ModelRunner(model, cache, None, block_size=block_size)
     with torch.inference_mode():
-        logits = model.forward_batch(batch, cache)
+        logits = model.forward_batch(batch)
     torch.testing.assert_close(
         logits, reference["logits"][0].float(), atol=1e-4, rtol=1e-4
     )

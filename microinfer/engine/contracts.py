@@ -2,7 +2,7 @@
 
 The primary nano-vllm path passes (list[Sequence], is_prefill), NOT SchedulerOutput.
 Snapshots remain available for isolated packing and cached-model oracle tests.
-See docs/engine-roadmap.md for lifecycle and validation rules.
+See docs/architecture.md for lifecycle and validation rules.
 """
 
 from dataclasses import dataclass

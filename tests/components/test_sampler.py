@@ -3,7 +3,7 @@ import torch
 
 from microinfer.layer.sampler import Sampler
 
-pytestmark = [pytest.mark.roadmap, pytest.mark.extension]
+pytestmark = [pytest.mark.component, pytest.mark.extension]
 
 
 def test_temperature_scaling_stability_and_input_ownership():

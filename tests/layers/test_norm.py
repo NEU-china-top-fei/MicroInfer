@@ -29,7 +29,6 @@ def test_unfused_norm_matches_rms_formula(
     torch.testing.assert_close(x, before)
 
 
-@pytest.mark.known_bug(reason="Residual output must carry x + residual, not only x")
 def test_norm_returns_accumulated_residual(tiny_config, eager_norm):
     x = torch.ones(2, 3, tiny_config.hidden_dim)
     residual = torch.full_like(x, 2.0)
@@ -37,9 +36,6 @@ def test_norm_returns_accumulated_residual(tiny_config, eager_norm):
     torch.testing.assert_close(carried, x + residual)
 
 
-@pytest.mark.known_bug(
-    reason="Fused norm construction/arithmetic and residual handling are incomplete"
-)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("with_residual", [False, True])
 def test_fused_norm_matches_rms_and_residual(
