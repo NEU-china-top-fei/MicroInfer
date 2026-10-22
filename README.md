@@ -12,6 +12,7 @@ Qwen3 推理引擎，支持 CPU 与单卡 CUDA，适合学习和实验推理引�
 - 温度采样、贪心生成、EOS / 长度停止与取消请求
 - 本地 safetensors 权重加载，支持 tied embeddings
 - CPU 参考实现与可选的 FlashAttention 后端
+- 可复现离线 benchmark（TTFT、TPOT、吞吐、显存），含 HF 与 nano-vllm 基线
 
 默认采用 eager 执行。暂不支持 Tensor Parallel、CUDA Graph、量化模型、滑动窗口注意力和
 scaled RoPE；本项目不以生产服务或吞吐性能为目标。
@@ -100,8 +101,9 @@ microinfer/
   llm.py        生成接口
 examples/       可运行示例
 scripts/        独立参考验证工具
+bench/          离线基准、引擎适配与 profiling
 tests/          单元、组件和集成测试
-docs/           架构文档
+docs/           架构与基准文档
 ```
 
 ## 测试与参考验证
@@ -117,6 +119,30 @@ python scripts/verify_checkpoint.py --model models/Qwen3-0.6B \
 默认测试使用小张量和临时随机 checkpoint，不下载模型。没有可用 CUDA 时，GPU 测试会跳过。
 独立参考验证覆盖 dense、chunked prefill、decode、前缀复用与贪心生成。
 详见 [测试指南](tests/README.md) 和 [架构说明](docs/architecture.md)。
+
+## 性能基线
+
+`bench/` 提供可复现的离线基准，覆盖单流、batch、混合长度、共享前缀和长 prefill；
+指标包括 TTFT、TPOT、输出吞吐和峰值显存，基线为 HF Transformers 与 nano-vllm。
+以下命令在仓库根目录运行；每个引擎在独立进程中执行，先 warmup 目标 shape，
+再取多次运行的中位数：
+
+```bash
+python -m bench.run_all --model /path/to/Qwen3-0.6B --runs 3 --warmup 1
+python -m bench.report --input-dir results/bench
+```
+
+当前 RTX 4060 Laptop / Qwen3-0.6B 的冷启动结果（output tok/s）：
+
+| workload | MicroInfer bs256 | HF Transformers | nano-vllm |
+| --- | ---: | ---: | ---: |
+| single-short | 37.5 | 75.1 | 153.0 |
+| batch8-short | 257.9 | 531.3 | 964.5 |
+| long-prefill | 21.7 | 56.9 | 93.0 |
+
+默认使用 cold cache；`--cache-mode warm` 用于观察重复 workload 的前缀缓存稳态收益。
+完整结果、profiling 热点和对比口径见 [docs/benchmarks.md](docs/benchmarks.md)。
+这是后续优化的起点，不是最终性能。
 
 ## 参考项目
 

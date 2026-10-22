@@ -56,6 +56,9 @@ class BlockManager:
         self.hash_to_block_id: dict[int, int] = {}
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        # Observability only; these counters do not affect allocation decisions.
+        self.prefix_cache_hit_blocks = 0
+        self.prefix_cache_hit_tokens = 0
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -94,6 +97,17 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
         # del self.hash_to_block_id[block.hash]
+
+    def reset_prefix_cache(self):
+        """Drop all cached prefix metadata; only valid when the pool is idle."""
+        if self.used_block_ids:
+            raise RuntimeError("cannot reset prefix cache while blocks are in use")
+        self.hash_to_block_id.clear()
+        for block in self.blocks:
+            block.hash = -1
+            block.token_ids = []
+        self.prefix_cache_hit_blocks = 0
+        self.prefix_cache_hit_tokens = 0
 
     def can_allocate(self, seq: Sequence) -> int:
         """
@@ -141,6 +155,8 @@ class BlockManager:
 
         """
         prefix = -1
+        self.prefix_cache_hit_blocks += num_cached_blocks
+        self.prefix_cache_hit_tokens += num_cached_blocks * self.block_size
         seq.num_cached_tokens = (
             self.block_size * num_cached_blocks
         )  # we need to cover previou value

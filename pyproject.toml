@@ -18,4 +18,4 @@ test = ["pytest>=8,<10", "transformers>=4.51,<6"]
 microinfer = "microinfer.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["microinfer*"]
+include = ["microinfer*", "bench*"]

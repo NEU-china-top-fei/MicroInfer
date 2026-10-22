@@ -20,6 +20,9 @@ Transformers 未安装时，独立参考测试会明确跳过；安装 test extr
 | components/ | Scheduler、KV 存储、paged attention、Runner、加载与输入输出契约 |
 | integration/ | 独立 Transformers 数值对照、真实引擎生成、失败恢复与容量边界 |
 
+`tests/components/test_bench.py` 只覆盖 benchmark 的 workload 生成、指标插值和计时契约，
+不加载模型。真实吞吐基线用 `bench/` 运行，见 [基准测试](../docs/benchmarks.md)。
+
 ```bash
 python -m pytest tests/engine -q
 python -m pytest tests/layers tests/model -q

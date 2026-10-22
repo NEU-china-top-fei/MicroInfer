@@ -95,3 +95,7 @@ dense 路径不改动 KV 池，packed 路径通过 Context 读写本层缓存：
 比较 dense、chunked、decode、共享前缀及完整贪心生成。
 `scripts/verify_checkpoint.py` 顺序加载真实模型，避免同时驻留两个完整模型，验证 logits 与生成 token。
 参考项目和改编代码的声明见 [第三方声明](../THIRD_PARTY_NOTICES.md)。
+
+`bench/` 是推理主路径之外的离线性能工具：它驱动 Scheduler/LLMEngine 直接收集 TTFT、TPOT、
+吞吐与显存，并提供 HF 与 nano-vllm 适配器。基线、profiling 热点和对比口径见
+[基准测试](benchmarks.md)。
