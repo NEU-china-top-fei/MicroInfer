@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from microinfer.utils.context import reset_context, set_context
+from microinfer.layer.metadata import AttentionMetadata
 
 pytestmark = [pytest.mark.component, pytest.mark.nano]
 
@@ -14,15 +14,17 @@ def test_lm_head_selects_one_row_per_sequence(tiny_config, seeded_torch, is_pref
     model = QwenModel(tiny_config).eval()
     # Two requests with query lengths 3 and 2. Decode has one row per request.
     hidden = torch.randn(5 if is_prefill else 2, tiny_config.hidden_dim)
-    try:
-        set_context(
-            is_prefill,
-            cu_seqlens_q=torch.tensor([0, 3, 5]) if is_prefill else None,
+    metadata = (
+        AttentionMetadata.build(
+            is_prefill=True,
+            cu_seqlens_q=torch.tensor([0, 3, 5], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 3, 5], dtype=torch.int32),
         )
-        with torch.inference_mode():
-            expected = model.out_logits(hidden[[2, 4]] if is_prefill else hidden)
-            actual = model.compute_logits(hidden)
-        assert actual.shape == (2, tiny_config.vocab_size)
-        torch.testing.assert_close(actual, expected)
-    finally:
-        reset_context()
+        if is_prefill
+        else AttentionMetadata.build(is_prefill=False, context_lens=torch.tensor([3, 2]))
+    )
+    with torch.inference_mode():
+        expected = model.out_logits(hidden[[2, 4]] if is_prefill else hidden)
+        actual = model.compute_logits(hidden, metadata)
+    assert actual.shape == (2, tiny_config.vocab_size)
+    torch.testing.assert_close(actual, expected)

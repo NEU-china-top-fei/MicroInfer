@@ -7,7 +7,6 @@ from microinfer.engine.scheduler import Scheduler
 from microinfer.engine.sequence import Sequence
 from microinfer.llm import LLM
 from microinfer.model.qwen3 import QwenModel
-from microinfer.utils.context import get_context
 
 pytestmark = pytest.mark.integration
 
@@ -55,7 +54,6 @@ def test_failed_runner_releases_all_admitted_requests_and_can_retry(llm, monkeyp
         llm.generate([[1, 2, 3], [4]], SampleParameter(max_tokens=2), use_tqdm=False)
     assert llm.engine.is_finished()
     assert not llm.engine.scheduler.block_manager.used_block_ids
-    assert get_context().slot_mapping is None
     monkeypatch.setattr(runner, "run_model", actual)
     assert (
         len(

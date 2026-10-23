@@ -1,7 +1,8 @@
 import pytest
 import torch
 
-from microinfer.layer.rope import RotaryCache, apply, comp_freq_cis, rotate
+from microinfer.layer.rope import RotaryCache
+from tests.support.rope import apply, comp_freq_cis, rotate
 
 
 def test_frequency_table_shape_and_zero_position():

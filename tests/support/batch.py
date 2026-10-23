@@ -1,34 +1,32 @@
-"""Optional numerical-test adapter; nano-vllm Runner uses Context directly."""
+"""Test-only packed-batch adapter (previously shipped in microinfer.worker.batch)."""
+
+from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 
 import torch
 
-from microinfer.engine.contracts import SchedulerOutput
+from tests.support.contracts import SchedulerOutput
 
 
 @dataclass
 class ModelInput:
-    input_ids: torch.Tensor  # int64 [T]
-    positions: torch.Tensor  # int64 [T], absolute within each request
-    slot_mapping: torch.Tensor  # int64 [T], physical_block * B + offset
-    cu_seqlens_q: torch.Tensor  # int32 [N+1]
-    context_lens: torch.Tensor  # int32 [N], prefix + this chunk
-    block_tables: torch.Tensor  # int32 [N, max_blocks], padding = -1
-    sample_indices: torch.Tensor  # int64 [S], last query row for sampling
-    temperatures: torch.Tensor  # float32 [S]
-    seq_ids: tuple[int, ...]  # N request IDs in packed order
-    sample_seq_ids: tuple[int, ...]  # S IDs, same order as sample_indices
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    slot_mapping: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    context_lens: torch.Tensor
+    block_tables: torch.Tensor
+    sample_indices: torch.Tensor
+    temperatures: torch.Tensor
+    seq_ids: tuple[int, ...]
+    sample_seq_ids: tuple[int, ...]
 
 
 def prepare_batch(
     output: SchedulerOutput, block_size: int, device: str | torch.device = "cpu"
 ) -> ModelInput:
-    """Do not mutate the snapshot. Reject invalid/duplicate IDs, empty items,
-    negative slots/positions and insufficient block tables with ValueError.
-    An empty SchedulerOutput is valid and has cu_seqlens_q=[0].
-    """
     if type(block_size) is not int or block_size <= 0:
         raise ValueError("block_size must be positive")
     ids, positions, slots, offsets, lengths, samples, temperatures = (

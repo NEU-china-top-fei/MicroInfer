@@ -59,6 +59,9 @@ def _meta(args, engine) -> dict:
         "cache_mode": args.cache_mode,
         "debug_mode": args.debug_mode if args.engine == "microinfer" else False,
         "use_compile": args.use_compile if args.engine == "microinfer" else False,
+        "fuse_weights": (
+            args.fuse_weights if args.engine == "microinfer" else False
+        ),
         "bench": {
             "runs": args.runs,
             "warmup": args.warmup,
@@ -132,6 +135,12 @@ def main() -> int:
         action="store_true",
         help="compile model forward (experimental; MicroInfer only)",
     )
+    parser.add_argument(
+        "--no-fuse-weights",
+        action="store_false",
+        dest="fuse_weights",
+        help="keep separate QKV/gate-up weights (lower memory; MicroInfer only)",
+    )
     parser.add_argument("--output-dir", default="results/bench")
     parser.add_argument("--tag", default="")
     parser.add_argument("--list-workloads", action="store_true")
@@ -172,6 +181,7 @@ def main() -> int:
         cache_mode=args.cache_mode,
         debug_mode=args.debug_mode,
         use_compile=args.use_compile,
+        fuse_weights=args.fuse_weights,
     ).load()
 
     workloads = build_workloads(names, seed=args.seed)

@@ -1,4 +1,4 @@
-"""Adapt per-call Context to attention kernels using only one layer's cache."""
+"""Attention over one layer's KV cache, driven by AttentionMetadata."""
 
 from itertools import pairwise
 
@@ -6,9 +6,58 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from microinfer.layer.metadata import AttentionMetadata
-from microinfer.layer.paged_attention import paged_attention_meta
+from microinfer.layer.paged_attention import (
+    flash_attn_varlen_func,
+    paged_attention_meta,
+)
 from microinfer.worker.kv_cache import LayerKVCache
+
+
+def _as_int32(tensor):
+    if tensor.dtype != torch.int32:
+        tensor = tensor.to(torch.int32)
+    return tensor.contiguous()
+
+
+def _direct_prefill_flash(q, k, v, metadata):
+    """FlashAttention varlen for prefix-free prefill, when supported."""
+    head_dim = q.shape[-1]
+    if (
+        flash_attn_varlen_func is None
+        or not q.is_cuda
+        or q.dtype not in (torch.float16, torch.bfloat16)
+        or head_dim > 256
+        or head_dim % 8
+        or metadata.cu_seqlens_q is None
+        or metadata.cu_seqlens_k is None
+        or metadata.max_seqlen_q <= 0
+        or metadata.max_seqlen_k <= 0
+    ):
+        return None
+    if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    return flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=_as_int32(metadata.cu_seqlens_q),
+        cu_seqlens_k=_as_int32(metadata.cu_seqlens_k),
+        max_seqlen_q=metadata.max_seqlen_q,
+        max_seqlen_k=metadata.max_seqlen_k,
+        dropout_p=0.0,
+        causal=True,
+    )
+
+
+def _direct_prefill_sdpa(q, k, v):
+    """GQA SDPA with a contiguous [1, H, L, D] layout (no repeat_interleave)."""
+    query = q.transpose(0, 1).contiguous().unsqueeze(0)
+    keys = k.transpose(0, 1).contiguous().unsqueeze(0)
+    values = v.transpose(0, 1).contiguous().unsqueeze(0)
+    out = F.scaled_dot_product_attention(
+        query, keys, values, is_causal=True, enable_gqa=True
+    )
+    return out.squeeze(0).transpose(0, 1)
 
 
 class CachedAttention(nn.Module):
@@ -19,9 +68,8 @@ class CachedAttention(nn.Module):
     def bind_cache(self, cache: LayerKVCache):
         self.cache = cache
 
-    def forward(self, q, k, v, metadata=None):
+    def forward(self, q, k, v, metadata):
         """Q/K already normalized/rotated. Return [T,Hq,D], including decode."""
-        metadata = metadata or AttentionMetadata.from_context()
         cache = self.cache
         # Metadata construction + Runner debug validation own this invariant;
         # keeping the list comparison here would graph-break torch.compile.
@@ -34,28 +82,25 @@ class CachedAttention(nn.Module):
             if metadata.slot_mapping is None:
                 raise ValueError("bound cache requires slot_mapping")
             if metadata.validate_cache_write:
-                cache.write(metadata.slot_mapping, k, v)
+                cache.write_checked(metadata.slot_mapping, k, v)
             else:
                 blocks, offsets = metadata.slot_indices(cache.block_size)
                 cache.write_fast(blocks, offsets, k, v)
         if not direct:
             return paged_attention_meta(q, cache.keys, cache.values, metadata)
 
-        # No-prefix prefill/warmup: current K/V suffice. SDPA also works on CPU.
-        # This eager path can later be replaced by flash_attn_varlen_func.
-        result = torch.empty_like(q)
+        # No-prefix prefill/warmup: current K/V suffice. FlashAttention varlen
+        # handles packed requests in one call; SDPA is the CPU/FP32 fallback.
         if q.shape[1] % k.shape[1]:
             raise ValueError("query heads must be divisible by KV heads")
-        repeats = q.shape[1] // k.shape[1]
+        flashed = _direct_prefill_flash(q, k, v, metadata)
+        if flashed is not None:
+            return flashed
+        result = torch.empty_like(q)
         for start, end in pairwise(metadata.cu_q_cpu):
             if start == end:
                 continue
-            keys = k[start:end].repeat_interleave(repeats, dim=1).transpose(0, 1)
-            values = v[start:end].repeat_interleave(repeats, dim=1).transpose(0, 1)
-            result[start:end] = F.scaled_dot_product_attention(
-                q[start:end].transpose(0, 1),
-                keys,
-                values,
-                is_causal=True,
-            ).transpose(0, 1)
+            result[start:end] = _direct_prefill_sdpa(
+                q[start:end], k[start:end], v[start:end]
+            )
         return result

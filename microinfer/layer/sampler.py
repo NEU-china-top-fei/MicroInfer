@@ -3,7 +3,11 @@ from torch import nn
 
 
 class Sampler(nn.Module):
-    def probabilities(self, logits, temperatures):
+    def __init__(self, validate: bool = True):
+        super().__init__()
+        self.validate = validate
+
+    def _validate(self, logits, temperatures):
         if (
             logits.ndim != 2
             or logits.shape[1] == 0
@@ -25,6 +29,10 @@ class Sampler(nn.Module):
             raise ValueError(
                 "each logits row must contain finite values, without NaN/+inf"
             )
+
+    def probabilities(self, logits, temperatures):
+        if self.validate:
+            self._validate(logits, temperatures)
         # Center before temperature scaling to avoid positive overflow.
         work = logits.float()
         return ((work - work.amax(-1, keepdim=True)) / temperatures[:, None]).softmax(

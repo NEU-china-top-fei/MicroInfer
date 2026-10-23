@@ -108,8 +108,10 @@ def main() -> int:
     rows.sort(key=lambda row: (row[0], row[1], row[2]))
 
     lines = [
-        "| workload | engine | out tok/s | TTFT p50 ms | TTFT p99 ms | "
-        "TPOT p50 ms | peak MB | throughput vs baseline |",
+        (
+            "| workload | engine | out tok/s | TTFT p50 ms | TTFT p99 ms | "
+            "TPOT p50 ms | peak MB | throughput vs baseline |"
+        ),
         "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for _, _, label, workload, tps, ttft50, ttft99, tpot50, peak, speedup in rows:

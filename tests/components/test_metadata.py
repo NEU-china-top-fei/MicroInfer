@@ -1,10 +1,9 @@
-"""AttentionMetadata contracts: lazy CPU lists and Context attachment."""
+"""AttentionMetadata contracts: lazy CPU lists and slot indices."""
 
 import pytest
 import torch
 
 from microinfer.layer.metadata import AttentionMetadata
-from microinfer.utils.context import Context
 
 pytestmark = pytest.mark.component
 
@@ -24,7 +23,6 @@ def test_prefill_metadata_derives_lists_lazily():
     assert metadata.cu_q_cpu == (0, 2, 5)
     assert metadata.q_lens_cpu == (2, 3)
     assert metadata.context_lens_cpu == (2, 3)
-    assert metadata.num_requests == 2
     # The tuple is cached; repeated attention layers do not re-run tolist().
     assert metadata.cu_q_cpu is metadata.cu_q_cpu
 
@@ -43,12 +41,6 @@ def test_decode_metadata_derives_query_offsets_from_context_lens():
     assert metadata.context_lens_cpu == (3, 4)
 
 
-def test_from_context_returns_attached_metadata():
-    attached = AttentionMetadata.build(is_prefill=False, context_lens=torch.tensor([2]))
-    context = Context(is_prefill=False, metadata=attached)
-    assert AttentionMetadata.from_context(context) is attached
-
-
 def test_slot_indices_are_cached_per_block_size():
     metadata = AttentionMetadata.build(
         is_prefill=False,
@@ -63,16 +55,3 @@ def test_slot_indices_are_cached_per_block_size():
     blocks2, offsets2 = metadata.slot_indices(2)
     assert blocks2.tolist() == [0, 2, 1]
     assert offsets2.tolist() == [0, 1, 0]
-
-
-def test_from_context_falls_back_to_context_fields():
-    context = Context(
-        is_prefill=True,
-        cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32),
-        cu_seqlens_k=torch.tensor([0, 2], dtype=torch.int32),
-        slot_mapping=torch.tensor([0, 1], dtype=torch.int32),
-    )
-    metadata = AttentionMetadata.from_context(context)
-    assert metadata.direct_prefill
-    assert metadata.q_lens_cpu == (2,)
-    assert metadata.context_lens_cpu == (2,)

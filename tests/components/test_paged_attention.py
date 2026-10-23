@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from microinfer.layer.paged_attention import paged_attention
+from tests.support.attention import checked_paged_attention as paged_attention
 
 pytestmark = pytest.mark.component
 

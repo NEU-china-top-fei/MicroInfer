@@ -3,8 +3,49 @@
 import torch
 
 from microinfer.layer.metadata import AttentionMetadata
-from microinfer.utils.context import get_context, reset_context, set_context
 from microinfer.worker.kv_cache import KVCache
+
+_DECODE_SCALARS = (
+    ("input_ids", torch.int64),
+    ("positions", torch.int64),
+    ("slot_mapping", torch.int32),
+    ("context_lens", torch.int32),
+)
+
+
+class _DecodeBuffers:
+    """Pinned staging + device buffers for the decode hot path."""
+
+    def __init__(self, device, pin_memory: bool):
+        self.device = device
+        self.pin_memory = pin_memory
+        self.capacity = 0
+        self.width = 0
+        self.cpu = {}
+        self.device_tensors = {}
+
+    def ensure(self, batch: int, width: int):
+        if batch <= self.capacity and width <= self.width:
+            return
+        capacity = max(batch, self.capacity)
+        width = max(width, self.width)
+        for name, dtype in _DECODE_SCALARS:
+            self.cpu[name] = torch.empty(
+                capacity, dtype=dtype, pin_memory=self.pin_memory
+            )
+            self.device_tensors[name] = torch.empty(
+                capacity, dtype=dtype, device=self.device
+            )
+        self.cpu["block_tables"] = torch.empty(
+            (capacity, width),
+            dtype=torch.int32,
+            pin_memory=self.pin_memory,
+        )
+        self.device_tensors["block_tables"] = torch.empty(
+            (capacity, width), dtype=torch.int32, device=self.device
+        )
+        self.capacity = capacity
+        self.width = width
 
 
 class ModelRunner:
@@ -30,6 +71,7 @@ class ModelRunner:
         self.use_compile = use_compile
         self._forward = None if self.model is None else self.model.forward
         self._compiled_forward = None
+        self._decode_buffers = None
         if self.use_compile and self.model is not None:
             # Build setup-only state (the 40k-row RoPE table) before Dynamo sees
             # it; tracing table construction is expensive and shape-specialized.
@@ -133,34 +175,52 @@ class ModelRunner:
             block_tables=block_tables,
             validate_cache_write=self.debug_mode,
         )
-        set_context(
-            True,
-            cu_q_tensor,
-            cu_k_tensor,
-            max_seqlen_q,
-            max_seqlen_k,
-            slot_tensor,
-            None,
-            block_tables,
-            metadata,
-        )
         input_ids = torch.tensor(ids, dtype=torch.int64, device=self.device)
         position_ids = torch.tensor(positions, dtype=torch.int64, device=self.device)
         if self.debug_mode:
-            self.validate_step(seqs, input_ids, position_ids, True)
-        return input_ids, position_ids
+            self.validate_step(seqs, input_ids, position_ids, metadata, True)
+        return input_ids, position_ids, metadata
 
     def prepare_decode(self, seqs):
-        positions = [len(s) - 1 for s in seqs]
-        slots = [
-            s.block_table[p // self.block_size] * self.block_size + p % self.block_size
-            for s, p in zip(seqs, positions)
-        ]
-        slot_tensor = torch.tensor(slots, dtype=torch.int32, device=self.device)
-        context_tensor = torch.tensor(
-            [len(s) for s in seqs], dtype=torch.int32, device=self.device
-        )
-        block_tables = self.prepare_block_tables(seqs)
+        batch = len(seqs)
+        width = max((len(s.block_table) for s in seqs), default=0)
+        if self._decode_buffers is None:
+            device = torch.device(self.device)
+            self._decode_buffers = _DecodeBuffers(
+                device, pin_memory=device.type == "cuda"
+            )
+        buffers = self._decode_buffers
+        buffers.ensure(batch, width)
+
+        cpu = buffers.cpu
+        block_cpu = cpu["block_tables"]
+        block_cpu[:batch].fill_(-1)
+        for i, seq in enumerate(seqs):
+            position = len(seq) - 1
+            cpu["input_ids"][i] = seq.last_token
+            cpu["positions"][i] = position
+            cpu["slot_mapping"][i] = (
+                seq.block_table[position // self.block_size] * self.block_size
+                + position % self.block_size
+            )
+            cpu["context_lens"][i] = len(seq)
+            block_cpu[i, : len(seq.block_table)] = torch.tensor(
+                seq.block_table, dtype=torch.int32
+            )
+
+        non_blocking = buffers.pin_memory
+        device_tensors = buffers.device_tensors
+        for name, _ in _DECODE_SCALARS:
+            device_tensors[name][:batch].copy_(
+                cpu[name][:batch], non_blocking=non_blocking
+            )
+        block_tables = device_tensors["block_tables"][:batch]
+        block_tables.copy_(block_cpu[:batch], non_blocking=non_blocking)
+
+        slot_tensor = device_tensors["slot_mapping"][:batch]
+        context_tensor = device_tensors["context_lens"][:batch]
+        input_ids = device_tensors["input_ids"][:batch]
+        position_ids = device_tensors["positions"][:batch]
         metadata = AttentionMetadata.build(
             is_prefill=False,
             slot_mapping=slot_tensor,
@@ -168,26 +228,14 @@ class ModelRunner:
             block_tables=block_tables,
             validate_cache_write=self.debug_mode,
         )
-        set_context(
-            False,
-            slot_mapping=slot_tensor,
-            context_lens=context_tensor,
-            block_tables=block_tables,
-            metadata=metadata,
-        )
-        input_ids = torch.tensor(
-            [s.last_token for s in seqs], dtype=torch.int64, device=self.device
-        )
-        position_ids = torch.tensor(positions, dtype=torch.int64, device=self.device)
         if self.debug_mode:
-            self.validate_step(seqs, input_ids, position_ids, False)
-        return input_ids, position_ids
+            self.validate_step(seqs, input_ids, position_ids, metadata, False)
+        return input_ids, position_ids, metadata
 
-    def validate_step(self, seqs, input_ids, positions, is_prefill):
+    def validate_step(self, seqs, input_ids, positions, metadata, is_prefill):
         """Validate scheduler/runner invariants; only called in debug_mode."""
-        context = get_context()
-        if context.is_prefill is not is_prefill:
-            raise ValueError("context mode does not match scheduled work")
+        if metadata.is_prefill is not is_prefill:
+            raise ValueError("metadata mode does not match scheduled work")
         if input_ids.ndim != 1 or positions.ndim != 1:
             raise ValueError("input_ids and positions must be 1-D")
         if input_ids.numel() != positions.numel() or input_ids.numel() == 0:
@@ -196,8 +244,8 @@ class ModelRunner:
             raise ValueError("a scheduled batch must contain requests")
 
         block_size = self.block_size
-        num_blocks = getattr(self.kv_cache, "num_blocks", None)
-        slots = context.slot_mapping
+        num_blocks = None if self.kv_cache is None else self.kv_cache.num_blocks
+        slots = metadata.slot_mapping
         if slots is None or slots.ndim != 1 or slots.numel() != input_ids.numel():
             raise ValueError("slot_mapping must match scheduled tokens")
         slot_list = [int(s) for s in slots.tolist()]
@@ -213,13 +261,14 @@ class ModelRunner:
         position_list = [int(p) for p in positions.tolist()]
         if any(p < 0 for p in position_list):
             raise ValueError("positions must be nonnegative")
-        max_pos = getattr(getattr(self.model, "config", None), "max_pos_embed", None)
+        model_config = getattr(self.model, "config", None)
+        max_pos = None if model_config is None else model_config.max_pos_embed
         if max_pos is not None and any(p >= max_pos for p in position_list):
             raise ValueError("position exceeds model max_pos_embed")
         token_list = [int(t) for t in input_ids.tolist()]
         if any(t < 0 for t in token_list):
             raise ValueError("input_ids must be nonnegative")
-        vocab = getattr(getattr(self.model, "config", None), "vocab_size", None)
+        vocab = None if model_config is None else model_config.vocab_size
         if vocab is not None and any(t >= vocab for t in token_list):
             raise ValueError("input_ids exceed model vocabulary")
 
@@ -234,7 +283,7 @@ class ModelRunner:
                     raise ValueError("block id exceeds KV pool")
 
         if is_prefill:
-            cu_q, cu_k = context.cu_seqlens_q, context.cu_seqlens_k
+            cu_q, cu_k = metadata.cu_seqlens_q, metadata.cu_seqlens_k
             if cu_q is None or cu_k is None:
                 raise ValueError("prefill requires cu_seqlens_q/cu_seqlens_k")
             q = [int(v) for v in cu_q.tolist()]
@@ -270,20 +319,20 @@ class ModelRunner:
                 k_lens.append(k_len)
             if q[-1] != sum(q_lens) or k[-1] != sum(k_lens):
                 raise ValueError("cu_seqlens totals do not match")
-            if context.max_seqlen_q != max(q_lens):
+            if metadata.max_seqlen_q != max(q_lens):
                 raise ValueError("max_seqlen_q does not match cu_seqlens_q")
-            if context.max_seqlen_k != max(k_lens):
+            if metadata.max_seqlen_k != max(k_lens):
                 raise ValueError("max_seqlen_k does not match cu_seqlens_k")
-            if any(seq.num_cached_tokens for seq in seqs) and context.block_tables is None:
+            if any(seq.num_cached_tokens for seq in seqs) and metadata.block_tables is None:
                 raise ValueError("cached prefixes require block_tables")
         else:
             if len(seqs) != input_ids.numel():
                 raise ValueError("decode needs exactly one token per request")
-            if context.context_lens is None or context.context_lens.numel() != len(seqs):
+            if metadata.context_lens is None or metadata.context_lens.numel() != len(seqs):
                 raise ValueError("decode requires one context length per request")
-            if context.block_tables is None:
+            if metadata.block_tables is None:
                 raise ValueError("decode requires block_tables")
-            lens = [int(v) for v in context.context_lens.tolist()]
+            lens = [int(v) for v in metadata.context_lens.tolist()]
             for i, (seq, context_len) in enumerate(zip(seqs, lens)):
                 if context_len != len(seq) or context_len <= 0:
                     raise ValueError("context length does not match sequence length")
@@ -299,13 +348,13 @@ class ModelRunner:
                 if slot_list[i] != expected_slot:
                     raise ValueError("decode slot does not match block table")
 
-        if context.block_tables is not None:
+        if metadata.block_tables is not None:
             if (
-                context.block_tables.ndim != 2
-                or context.block_tables.shape[0] != len(seqs)
+                metadata.block_tables.ndim != 2
+                or metadata.block_tables.shape[0] != len(seqs)
             ):
                 raise ValueError("block_tables must be [num_requests, max_blocks]")
-            table = context.block_tables.tolist()
+            table = metadata.block_tables.tolist()
             for i, seq in enumerate(seqs):
                 context_len = (
                     seq.num_cached_tokens + seq.num_scheduled_tokens
@@ -332,9 +381,7 @@ class ModelRunner:
             return self._compiled_forward
         return self._forward
 
-    def run_model(self, input_ids, positions, is_prefill, metadata=None):
-        if metadata is None:
-            metadata = AttentionMetadata.from_context()
+    def run_model(self, input_ids, positions, is_prefill, metadata):
         hidden = self._forward_for(is_prefill)(input_ids, positions, metadata)
         return self.model.compute_logits(hidden, metadata)
 
@@ -343,20 +390,19 @@ class ModelRunner:
         if not seqs:
             return []
         self.model.eval()
-        try:
-            ids, positions = (
-                self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-            )
-            metadata = get_context().metadata
-            logits = self.run_model(ids, positions, is_prefill, metadata)
+        ids, positions, metadata = (
+            self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+        )
+        logits = self.run_model(ids, positions, is_prefill, metadata)
+        greedy_flags = [s.greedy for s in seqs]
+        if all(greedy_flags):
+            tokens = logits.argmax(-1)
+        elif not any(greedy_flags):
+            tokens = self.sampler(logits, self.prepare_sample(seqs))
+        else:
+            tokens = self.sampler(logits, self.prepare_sample(seqs))
             greedy = torch.tensor(
-                [getattr(s, "greedy", False) for s in seqs], device=logits.device
+                greedy_flags, device=logits.device, dtype=torch.bool
             )
-            if greedy.all():
-                tokens = logits.argmax(-1)
-            else:
-                tokens = self.sampler(logits, self.prepare_sample(seqs))
-                tokens = torch.where(greedy, logits.argmax(-1), tokens)
-            return tokens.tolist()
-        finally:
-            reset_context()
+            tokens = torch.where(greedy, logits.argmax(-1), tokens)
+        return tokens.tolist()

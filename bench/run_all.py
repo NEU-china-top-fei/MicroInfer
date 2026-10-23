@@ -42,6 +42,12 @@ def main() -> int:
         action="store_true",
         help="compile MicroInfer model forward (experimental)",
     )
+    parser.add_argument(
+        "--no-fuse-weights",
+        action="store_false",
+        dest="fuse_weights",
+        help="keep separate QKV/gate-up weights (lower memory)",
+    )
     parser.add_argument("--output-dir", default="results/bench")
     parser.add_argument("--skip-bs16", action="store_true")
     parser.add_argument(
@@ -108,6 +114,8 @@ def main() -> int:
                 command.append("--debug-mode")
             if args.use_compile:
                 command.append("--use-compile")
+            if not args.fuse_weights:
+                command.append("--no-fuse-weights")
             commands.append((f"microinfer {tag}", command))
     if "hf" in engines:
         commands.append(("hf", common + ["--engine", "hf"]))

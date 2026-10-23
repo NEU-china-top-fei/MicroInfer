@@ -1,11 +1,5 @@
 from .norm import FuseLayerNorm
-from .rope import RotaryCache, apply, comp_freq_cis
+from .rope import RotaryCache
 from .transformer import TransformerLayer
 
-__all__ = [
-    "FuseLayerNorm",
-    "RotaryCache",
-    "TransformerLayer",
-    "apply",
-    "comp_freq_cis",
-]
+__all__ = ["FuseLayerNorm", "RotaryCache", "TransformerLayer"]

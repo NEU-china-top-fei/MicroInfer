@@ -1,4 +1,4 @@
-"""Cache ownership, layer binding, and Context adaptation."""
+"""Cache ownership, layer binding, and AttentionMetadata adaptation."""
 
 import pytest
 import torch
@@ -6,15 +6,8 @@ import torch
 from microinfer.layer.cached_attention import CachedAttention
 from microinfer.layer.metadata import AttentionMetadata
 from microinfer.runner import ModelRunner
-from microinfer.utils.context import reset_context, set_context
 from microinfer.worker.kv_cache import KVCache
-
-
-@pytest.fixture(autouse=True)
-def clean_context():
-    reset_context()
-    yield
-    reset_context()
+from tests.support.kv import gather
 
 
 def test_layer_view_shares_storage_and_cannot_write_other_layers():
@@ -27,7 +20,9 @@ def test_layer_view_shares_storage_and_cannot_write_other_layers():
         view.values.untyped_storage().data_ptr()
         == pool.values.untyped_storage().data_ptr()
     )
-    view.write(torch.tensor([4, 1]), torch.ones(2, 1, 4), torch.full((2, 1, 4), 3.0))
+    view.write_checked(
+        torch.tensor([4, 1]), torch.ones(2, 1, 4), torch.full((2, 1, 4), 3.0)
+    )
     assert pool.keys[1, 2, 0].eq(1).all()
     assert pool.values[1, 0, 1].eq(3).all()
     assert pool.keys[0].eq(0).all() and pool.values[0].eq(0).all()
@@ -37,14 +32,14 @@ def test_layer_view_shares_storage_and_cannot_write_other_layers():
 def test_empty_and_padding_only_writes_leave_storage_unchanged(slots):
     view = KVCache(1, 1, 2, 1, 4).layer(0)
     values = torch.ones(len(slots), 1, 4)
-    view.write(torch.tensor(slots, dtype=torch.long), values, values)
+    view.write_checked(torch.tensor(slots, dtype=torch.long), values, values)
     assert view.keys.eq(0).all() and view.values.eq(0).all()
 
 
 def test_layer_write_validates_both_inputs_before_mutation():
     view = KVCache(1, 1, 2, 1, 4).layer(0)
     with pytest.raises(ValueError):
-        view.write(torch.tensor([0]), torch.ones(1, 1, 4), torch.ones(2, 1, 4))
+        view.write_checked(torch.tensor([0]), torch.ones(1, 1, 4), torch.ones(2, 1, 4))
     assert view.keys.eq(0).all()
 
 
@@ -66,7 +61,7 @@ def test_runner_allocates_and_rebinds_every_layer_without_model_owning_pool(mode
     for i, layer in enumerate(model.transformer_layers):
         view = layer.attention.attn.cache
         assert view.keys.data_ptr() == second.keys[i].data_ptr()
-        view.write(torch.tensor([0]), torch.ones(1, 2, 4), torch.ones(1, 2, 4))
+        view.write_checked(torch.tensor([0]), torch.ones(1, 2, 4), torch.ones(1, 2, 4))
     assert first.keys.eq(0).all()
     assert second.keys[:, 0, 0].eq(1).all()
     assert set(model.state_dict()) == state_keys
@@ -117,33 +112,46 @@ def test_cached_chunks_and_decode_match_full_prefill_with_noncontiguous_blocks(
     outputs = []
     for start, end in [(0, 3), (3, 5), (5, 6)]:
         prefill = start != 5
-        set_context(
-            prefill,
-            cu_seqlens_q=torch.tensor([0, end - start]) if prefill else None,
-            cu_seqlens_k=torch.tensor([0, end]) if prefill else None,
-            slot_mapping=slots[start:end],
-            block_tables=None if start == 0 else torch.tensor([[2, 0, 3]]),
-            context_lens=None if prefill else torch.tensor([end]),
-        )
-        outputs.append(backend(q[start:end], k[start:end], v[start:end]))
+        if prefill:
+            metadata = AttentionMetadata.build(
+                is_prefill=True,
+                cu_seqlens_q=torch.tensor([0, end - start]),
+                cu_seqlens_k=torch.tensor([0, end]),
+                max_seqlen_q=end - start,
+                max_seqlen_k=end,
+                slot_mapping=slots[start:end],
+                block_tables=None if start == 0 else torch.tensor([[2, 0, 3]]),
+            )
+        else:
+            metadata = AttentionMetadata.build(
+                is_prefill=False,
+                slot_mapping=slots[start:end],
+                context_lens=torch.tensor([end]),
+                block_tables=torch.tensor([[2, 0, 3]]),
+            )
+        outputs.append(backend(q[start:end], k[start:end], v[start:end], metadata))
     torch.testing.assert_close(torch.cat(outputs), expected, atol=1e-5, rtol=1e-5)
     assert pool.keys[0].eq(0).all()
-    torch.testing.assert_close(pool.layer(1).gather([2, 0, 3], 6)[0], k)
+    torch.testing.assert_close(gather(pool.layer(1), [2, 0, 3], 6)[0], k)
 
 
 def test_no_prefix_prefill_isolates_requests_without_cache(seeded_torch):
     q, k, v = torch.randn(5, 4, 4), torch.randn(5, 2, 4), torch.randn(5, 2, 4)
-    set_context(
-        True, cu_seqlens_q=torch.tensor([0, 3, 5]), cu_seqlens_k=torch.tensor([0, 3, 5])
+    metadata = AttentionMetadata.build(
+        is_prefill=True,
+        cu_seqlens_q=torch.tensor([0, 3, 5]),
+        cu_seqlens_k=torch.tensor([0, 3, 5]),
+        max_seqlen_q=3,
+        max_seqlen_k=5,
     )
-    actual = CachedAttention()(q, k, v)
+    actual = CachedAttention()(q, k, v, metadata)
     expected = torch.cat(
         [dense_reference(q[:3], k[:3], v[:3]), dense_reference(q[3:], k[3:], v[3:])]
     )
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
 
-def test_explicit_metadata_uses_fast_cache_write(seeded_torch):
+def test_fast_cache_write_matches_checked_path(seeded_torch):
     q, k, v = torch.randn(3, 4, 4), torch.randn(3, 2, 4), torch.randn(3, 2, 4)
     pool = KVCache(1, 2, 4, 2, 4)
     backend = CachedAttention()
@@ -152,6 +160,8 @@ def test_explicit_metadata_uses_fast_cache_write(seeded_torch):
         is_prefill=True,
         cu_seqlens_q=torch.tensor([0, 3]),
         cu_seqlens_k=torch.tensor([0, 3]),
+        max_seqlen_q=3,
+        max_seqlen_k=3,
         slot_mapping=torch.tensor([0, 1, 2]),
         validate_cache_write=False,
     )
@@ -162,22 +172,12 @@ def test_explicit_metadata_uses_fast_cache_write(seeded_torch):
     torch.testing.assert_close(pool.layer(0).values[0, :3], v)
 
 
-def test_explicit_metadata_prefill_does_not_need_context(seeded_torch):
-    q, k, v = torch.randn(5, 4, 4), torch.randn(5, 2, 4), torch.randn(5, 2, 4)
-    metadata = AttentionMetadata.build(
-        is_prefill=True,
-        cu_seqlens_q=torch.tensor([0, 3, 5]),
-        cu_seqlens_k=torch.tensor([0, 3, 5]),
-    )
-    actual = CachedAttention()(q, k, v, metadata)
-    expected = torch.cat(
-        [dense_reference(q[:3], k[:3], v[:3]), dense_reference(q[3:], k[3:], v[3:])]
-    )
-    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
-
-
 def test_decode_without_bound_cache_fails_clearly():
-    set_context(False, context_lens=torch.tensor([1]), block_tables=torch.tensor([[0]]))
+    metadata = AttentionMetadata.build(
+        is_prefill=False,
+        context_lens=torch.tensor([1]),
+        block_tables=torch.tensor([[0]]),
+    )
     q = torch.zeros(1, 1, 4)
     with pytest.raises(RuntimeError, match="bound layer cache"):
-        CachedAttention()(q, q, q)
+        CachedAttention()(q, q, q, metadata)

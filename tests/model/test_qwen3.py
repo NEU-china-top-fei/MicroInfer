@@ -38,6 +38,63 @@ def test_embedding_final_norm_and_logits_without_transformer(tiny_config, seeded
     torch.testing.assert_close(logits, expected_logits)
 
 
+def test_fused_qkv_and_gate_up_match_unfused(tiny_config, seeded_torch):
+    from microinfer.model.qwen3 import QwenModel
+
+    tiny_config.rope_base = 10000.0
+    model = QwenModel(tiny_config).eval()
+    ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+    positions = torch.arange(3)
+    with torch.no_grad():
+        before = model(ids, positions)
+
+    model.fuse_weights()
+    layer = model.transformer_layers[0]
+    assert layer.attention.qkv_weight.shape == (
+        tiny_config.num_q_head * tiny_config.head_dim
+        + 2 * tiny_config.num_kv_head * tiny_config.head_dim,
+        tiny_config.hidden_dim,
+    )
+    assert layer.ffn.gate_up_weight.shape == (
+        2 * tiny_config.MLP_inter_dim,
+        tiny_config.hidden_dim,
+    )
+    state = {name: value.clone() for name, value in model.state_dict().items()}
+    assert "qkv_weight" not in state
+    assert "gate_up_weight" not in state
+    assert "transformer_layers.0.attention.q_proj.weight" in state
+    assert "transformer_layers.0.attention.k_proj.weight" in state
+    # Projection Parameters are views of the packed storage, not duplicates.
+    assert (
+        layer.attention.q_proj.weight.untyped_storage().data_ptr()
+        == layer.attention.qkv_weight.untyped_storage().data_ptr()
+    )
+    assert (
+        layer.ffn.gate_project.weight.untyped_storage().data_ptr()
+        == layer.ffn.gate_up_weight.untyped_storage().data_ptr()
+    )
+
+    with torch.no_grad():
+        after = model(ids, positions)
+    torch.testing.assert_close(after, before, atol=1e-5, rtol=1e-5)
+
+    # state_dict keys still work and load into the shared storage.
+    layer.attention.qkv_weight.zero_()
+    layer.ffn.gate_up_weight.zero_()
+    missing, unexpected = model.load_state_dict(state)
+    assert not missing and not unexpected
+    with torch.no_grad():
+        reloaded = model(ids, positions)
+    torch.testing.assert_close(reloaded, before, atol=1e-5, rtol=1e-5)
+
+    # Idempotent: a second call must not concatenate the buffers again.
+    model.fuse_weights()
+    assert layer.attention.qkv_weight.shape[0] == (
+        tiny_config.num_q_head * tiny_config.head_dim
+        + 2 * tiny_config.num_kv_head * tiny_config.head_dim
+    )
+
+
 def test_model_passes_positions_and_accumulates_final_residual(tiny_config):
     from microinfer.model.qwen3 import QwenModel
 

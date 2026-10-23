@@ -92,6 +92,7 @@ def _load_model(args, workload, *, nvtx: bool):
                 max_model_len=4096,
             ),
             use_compile=args.use_compile,
+            fuse_weights=args.fuse_weights,
         )
 
 
@@ -235,8 +236,10 @@ def _run_torch(args, workload, prompts, output_len: int) -> int:
         f"- cudaLaunchKernel: {launches} ({launches / output_tokens:.1f}/token)",
         f"- cudaStreamSynchronize: {syncs} ({syncs / output_tokens:.1f}/token)",
         f"- aten::mm: {gemms} ({gemms / output_tokens:.1f}/token)",
-        "- note: profiling instruments every launch; use these ratios for hotspot "
-        "attribution, not absolute throughput",
+        (
+            "- note: profiling instruments every launch; use these ratios for "
+            "hotspot attribution, not absolute throughput"
+        ),
         "",
         "## Top CUDA activities",
         "",
@@ -317,6 +320,8 @@ def _run_nsys(args, workload) -> int:
         child_argv.append("--cold")
     if args.use_compile:
         child_argv.append("--use-compile")
+    if not args.fuse_weights:
+        child_argv.append("--no-fuse-weights")
 
     command = nsys_command(
         nsys_bin,
@@ -372,6 +377,12 @@ def main() -> int:
         "--use-compile",
         action="store_true",
         help="compile the decode forward before profiling",
+    )
+    parser.add_argument(
+        "--no-fuse-weights",
+        action="store_false",
+        dest="fuse_weights",
+        help="keep separate QKV/gate-up weights (lower memory)",
     )
     parser.add_argument(
         "--export",

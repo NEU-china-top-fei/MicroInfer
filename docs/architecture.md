@@ -28,7 +28,7 @@ LLM.generate
 | Scheduler | 请求准入、prefill/decode 选择、预算、抢占和完成 |
 | KVCache / LayerKVCache | 全局张量分配与单层零拷贝视图 |
 | CachedAttention | 写入本层缓存，接收每步 `AttentionMetadata` |
-| paged_attention | 物理块读取、GQA 与带前缀偏移的 causal mask；`_meta` 快路径 + 校验入口 |
+| paged_attention_meta | 物理块读取、GQA 与带前缀偏移的 causal mask（生产入口） |
 | QwenModel | embedding、decoder layers、final norm 和 LM head |
 | ModelRunner | 准备模型输入、绑定缓存、执行与采样 |
 | LLMEngine | schedule → run → postprocess 循环 |
@@ -52,7 +52,7 @@ Scheduler 限制单轮在途执行，校验 postprocess 与已调度工作的一
 超长 prompt 在入队前报错；生成到容量上限按长度结束。
 Sequence 的 block_size 按实例设置，多个引擎不需要修改进程级全局配置。
 
-## KV 缓存与 Context
+## KV 缓存与 AttentionMetadata
 
 Runner 持有 `KVCache.keys/values: [layers, blocks, B, Hkv, D]`。
 `cache.layer(i)` 返回本层 `[blocks, B, Hkv, D]` 张量视图，绑定过程不复制存储。
@@ -60,8 +60,8 @@ Runner 持有 `KVCache.keys/values: [layers, blocks, B, Hkv, D]`。
 
 LayerKVCache 有两个写入入口：`write_checked` 支持 `-1` padding，并在写入前验证形状、
 范围和重复 slot；`write_fast` 接收 `AttentionMetadata.slot_indices` 预计算好的
-`blocks/offsets`，不做 host 校验。`write` 保留为 checked 别名。生产 decode 走
-`write_fast`，`debug_mode=True` 时走 `write_checked`。
+`blocks/offsets`，不做 host 校验。生产 decode 走 `write_fast`，
+`debug_mode=True` 时走 `write_checked`。
 BlockManager 管引用计数，释放块不清零张量。计算只读取有效块表与 context lengths 指定的数据。
 
 Runner 每步构建一次 `AttentionMetadata`，包含 slot、位置、`cu_seqlens_q/k`、
@@ -70,10 +70,10 @@ context lengths、block tables 和直接 prefill 标记；`ModelRunner.run_model
 `cu_q_cpu` / `context_lens_cpu` 是懒加载并缓存的：decode flash 路径不会 `.tolist()`，
 只有 prefill/参考路径在第一次访问时转换一次。
 
-Context 使用 ContextVar 保存同一份 metadata 以及 slot、位置、序列长度与块表，
-用于测试、`forward_batch` 和直接调用兼容；Runner 在 finally 中清理。
-`AttentionMetadata.from_context()` 在 metadata 缺失时从 Context 字段重建。
-Context 隔离不等于共享缓存可并发写入。
+metadata 是每步的显式运行时参数，没有全局 Context：`prepare_prefill/decode`
+返回 `(input_ids, positions, metadata)`，模型、attention 和 cache 接收同一个对象。
+测试需要的 packed-batch/forward adapter 放在 `tests/support/`，不进入运行时包。
+共享 KV 缓存不能并发写入。
 
 先确定模型 dtype/device，再分配池；更换池时需要同步重建 BlockManager，不能保留旧前缀索引。
 缓存是运行时数据，不属于模型权重，也不写入 state_dict。
@@ -83,26 +83,31 @@ Context 隔离不等于共享缓存可并发写入。
 Qwen3 使用 bias-free SwiGLU、逐 head Q/K RMSNorm、split-half RoPE 和 GQA。
 `QwenModel` 创建一个 `RotaryCache`，28 层共享同一张 FP32 `cos/sin` 表；表在第一次
 forward 时按 activation device 懒构建，按 position 索引，不在每层重新计算角度或复数。
-`rope.apply` / `rotate` 仍保留为独立算子接口，供测试和非模型路径使用。
-RMSNorm 默认走 `F.rms_norm` fused kernel（内部 FP32 累加），并返回累加后的
-residual；`fused_layer_norm=False` 时保留逐 op 的 `_reference_forward` 路径，
-用于测试和 A/B。Q/K norm 复用同一个 `FuseLayerNorm`。
+RMSNorm 走 `F.rms_norm` fused kernel（内部 FP32 累加），并返回累加后的 residual；
+Q/K norm 复用同一个 `FuseLayerNorm`。
+
+`QwenModel.fuse_weights()` 可选地把每层 Q/K/V 合并成一次 GEMM、gate/up 合并成一次
+GEMM，结果放在非持久 buffer 中。原始 projection Parameter 随后被替换为该 buffer
+的视图，与 packed 权重共享 storage；因此 checkpoint 映射和 `state_dict` key 不变，
+稳态显存也不会翻倍。`load_state_dict` 写入视图时会同步更新 packed buffer。
+`--no-fuse-weights` 可关闭打包用于 A/B。fuse 应在最终 `.to(device/dtype)` 之后调用。
 
 Attention.forward 支持 dense `[batch, length, hidden]` 与 packed `[tokens, hidden]`。
 dense 路径不改动 KV 池，packed 路径通过 `AttentionMetadata` 读写本层缓存：
 
-- Runner 每步构建一次 metadata；Attention/CachedAttention 不再每层读 ContextVar。
-- 无前缀 prefill 直接对本轮 K/V 做逐请求 SDPA，同时写缓存。
+- Runner 每步构建一次 metadata，显式传给 Attention/CachedAttention。
+- 无前缀 prefill 先尝试 `flash_attn_varlen_func`（packed 请求一次调用）；CPU/FP32
+  或形状不满足时回退到 4D `[1,H,L,D]` + `enable_gqa=True` 的 SDPA，不再
+  `repeat_interleave` 或落到 math 后端。
 - 有前缀 prefill 的 context lengths 由 metadata 从 `cu_seqlens_k` 差分得到。
 - decode 的 Q offsets 由 metadata 懒生成，不再每层 `arange`。
-- `paged_attention_meta` 是生产快路径：不做 host 校验、不 `.tolist()`，直接使用
-  int32/连续 tensor；`paged_attention` 保留为独立调用和测试的严格校验入口。
+- `paged_attention_meta` 是唯一的生产入口：不做 host 校验、不 `.tolist()`，直接使用
+  int32/连续 tensor。测试用的严格校验入口在 `tests/support/attention.py`。
 - 分页参考后端的 FP16/BF16 输入在 FP32 中计算 QK、softmax、PV，输出转回输入 dtype。
 - 满足设备、dtype、head dimension 和块大小约束时，可调用 FlashAttention 分页后端。
 
 `compute_logits` 在 prefill 选择每请求最后一个 query，在 decode 保留所有行；
-metadata 显式传入，缺失时才回退 Context。`forward_batch(batch)` 为数值验证 adapter，
-返回全部 query 的 logits；调用前由 Runner 绑定测试池。
+metadata 显式传入。数值测试的 all-query adapter 在 `tests/support/model.py`。
 
 ### 执行与可选编译
 
@@ -112,6 +117,13 @@ decode 形状更稳定，compile 能把 elementwise/norm 等小 kernel 融合。
 调用 `RotaryCache.ensure()` 建好 cos/sin 表，避免 Dynamo 追踪 40k 行表构造。
 `AttentionMetadata`、fast KV 写入和显式 metadata 是这一阶段能 compile 的前提。
 FlashAttention 的 pybind op 仍是 opaque custom kernel 边界，compile 会在它周围分段。
+
+decode 的 metadata 使用 `_DecodeBuffers`：pinned CPU staging + 复用 device buffer，
+每个 step 原地填充 `input_ids/positions/slot_mapping/context_lens/block_tables`，
+再 `copy_(non_blocking=True)`。这去掉了每步 `torch.tensor(list, device="cuda")`
+的 H2D 同步，也为 P2 的静态 buffer/CUDA Graph 留好了形状稳定的容器。唯一的架构性
+同步是最后 `tokens.tolist()`。`Sampler` 的 logits 有限性校验只在
+`debug_mode=True` 时执行。
 
 ## 权重与验证
 

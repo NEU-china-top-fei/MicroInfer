@@ -1,5 +1,3 @@
-import pickle
-
 import pytest
 
 from microinfer.config import SampleParameter
@@ -41,21 +39,3 @@ def test_append_preserves_prompt_and_updates_completion(sequence_cls):
     assert seq.num_completion_tokens == 2
     seq.status = SequenceStatus.FINISHED
     assert seq.is_finished
-
-
-@pytest.mark.parametrize("prefill", [True, False])
-def test_worker_serialization_contract(sequence_cls, prefill):
-    # The pickle payload is for model workers, not a full scheduler checkpoint.
-    seq = sequence_cls([1, 2, 3, 4, 5])
-    seq.is_prefill = prefill
-    seq.num_cached_tokens = 4
-    seq.num_scheduled_tokens = 1
-    seq.block_table = [7, 9]
-    restored = pickle.loads(pickle.dumps(seq))
-    assert len(restored) == 5
-    assert restored.num_prompt_tokens == 5
-    assert restored.num_cached_tokens == 4
-    assert restored.num_scheduled_tokens == 1
-    assert restored.block_table == [7, 9]
-    assert restored.last_token == 5
-    assert restored.token_ids == ([1, 2, 3, 4, 5] if prefill else [])

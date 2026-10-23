@@ -95,14 +95,13 @@ microinfer/
   engine/       请求状态、物理块管理、调度与执行循环
   layer/        模型算子与 attention 后端
   model/        Qwen3 模型及权重加载
-  worker/       KV 张量存储与输入打包
-  utils/        执行上下文
-  runner.py     模型执行与缓存绑定
+  worker/       KV 张量存储
+  runner.py     模型执行、metadata 与缓存绑定
   llm.py        生成接口
 examples/       可运行示例
 scripts/        独立参考验证工具
 bench/          离线基准、引擎适配与 profiling
-tests/          单元、组件和集成测试
+tests/          单元、组件、集成测试与测试专用 adapter（tests/support/）
 docs/           架构与基准文档
 ```
 

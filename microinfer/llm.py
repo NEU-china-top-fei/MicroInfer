@@ -29,6 +29,7 @@ class LLM:
         engine_config=None,
         debug_mode=None,
         use_compile=None,
+        fuse_weights=True,
     ):
         from microinfer.engine.blockmanager import BlockManager
         from microinfer.engine.llm_engine import LLMEngine
@@ -49,10 +50,14 @@ class LLM:
             config = replace(config, **overrides)
         if config.max_model_len > model.config.max_pos_embed:
             raise ValueError("engine context exceeds model position limit")
+        if fuse_weights:
+            fuse = getattr(model, "fuse_weights", None)
+            if fuse is not None:
+                fuse()
         runner = ModelRunner(
             model.eval(),
             None,
-            Sampler(),
+            Sampler(validate=config.debug_mode),
             block_size=block_size,
             device=model.embedding.weight.device,
             debug_mode=config.debug_mode,
@@ -82,6 +87,7 @@ class LLM:
         engine_config=None,
         debug_mode=None,
         use_compile=None,
+        fuse_weights=True,
     ):
         """Load a local Qwen3 directory. Never downloads or executes remote code."""
         import torch
@@ -120,6 +126,7 @@ class LLM:
             engine_config=engine_config,
             debug_mode=debug_mode,
             use_compile=use_compile,
+            fuse_weights=fuse_weights,
         )
 
     def generate(self, prompts, sampling_params=None, use_tqdm=True):
@@ -165,9 +172,8 @@ class LLM:
                         progress.update(1)
             return [results[s.seq_id] for s in seqs]
         except Exception:
-            if hasattr(self.engine, "abort"):
-                for seq in admitted:
-                    self.engine.abort(seq.seq_id)
+            for seq in admitted:
+                self.engine.abort(seq.seq_id)
             raise
         finally:
             if progress is not None:

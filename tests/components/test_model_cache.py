@@ -1,10 +1,11 @@
 import pytest
 import torch
 
-from microinfer.engine.contracts import ScheduledSequence, SchedulerOutput
 from microinfer.runner import ModelRunner
-from microinfer.worker.batch import prepare_batch
 from microinfer.worker.kv_cache import KVCache
+from tests.support.batch import prepare_batch
+from tests.support.contracts import ScheduledSequence, SchedulerOutput
+from tests.support.model import forward_batch
 
 pytestmark = [pytest.mark.component, pytest.mark.integration]
 
@@ -34,7 +35,7 @@ def model_and_cache(tiny_config, seeded_torch):
 def run_cached(model, batch, cache):
     # Binding is a runner/setup concern, never a model.forward argument.
     ModelRunner(model, cache, None, block_size=cache.block_size)
-    return model.forward_batch(batch)
+    return forward_batch(model, batch)
 
 
 def packed(tokens, start, blocks, seq_id=1):

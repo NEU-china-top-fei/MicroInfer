@@ -1,10 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import torch
 
 
 @dataclass
@@ -16,12 +12,8 @@ class QwenConfig:
     num_q_head: int = 16
     num_kv_head: int = 8
     head_dim: int = 128
-    fused_layer_norm: bool = True
     num_hidden_layer: int = 28
     max_pos_embed: int = 40960
-    block_size: int = 256
-    num_blocks: int = 32
-    device: str | torch.device = "cpu"
 
     rope_base: float = 1000000.0
     rope_interleaved: bool = False

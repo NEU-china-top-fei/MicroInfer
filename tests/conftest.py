@@ -23,7 +23,6 @@ def tiny_config():
         head_dim=4,
         num_hidden_layer=2,
         max_pos_embed=16,
-        fused_layer_norm=False,
     )
 
 
@@ -48,15 +47,3 @@ def seeded_torch():
     with torch.random.fork_rng(devices=devices):
         torch.manual_seed(0)
         yield torch
-
-
-@pytest.fixture
-def eager_norm(monkeypatch):
-    from microinfer.layer.norm import FuseLayerNorm
-
-    # Validate arithmetic without compiler startup; no arithmetic is mocked.
-    method = FuseLayerNorm.fwd_fuse_tobe_compile
-    monkeypatch.setattr(
-        FuseLayerNorm, "fwd_fuse_tobe_compile", getattr(method, "__wrapped__", method)
-    )
-    return FuseLayerNorm

@@ -34,6 +34,7 @@ class MicroInferEngine:
         cache_mode="cold",
         debug_mode=False,
         use_compile=False,
+        fuse_weights=True,
     ):
         if cache_mode not in ("cold", "warm"):
             raise ValueError("cache_mode must be cold or warm")
@@ -42,6 +43,7 @@ class MicroInferEngine:
         self.model_path = str(model_path)
         self.debug_mode = debug_mode
         self.use_compile = use_compile
+        self.fuse_weights = fuse_weights
         self.cache_mode = cache_mode
         self.device = torch.device(device)
         self.dtype = dtype
@@ -71,6 +73,7 @@ class MicroInferEngine:
             engine_config=engine_config,
             debug_mode=self.debug_mode,
             use_compile=self.use_compile,
+            fuse_weights=self.fuse_weights,
         )
         cache = self.llm.engine.model_runner.kv_cache
         self.meta = {
@@ -84,6 +87,7 @@ class MicroInferEngine:
             "cache_mode": self.cache_mode,
             "debug_mode": self.debug_mode,
             "use_compile": self.use_compile,
+            "fuse_weights": self.fuse_weights,
         }
         return self
 

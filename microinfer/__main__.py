@@ -23,6 +23,12 @@ def main():
         help="compile the model forward (experimental; P1.5 tunes it)",
     )
     parser.add_argument(
+        "--no-fuse-weights",
+        action="store_false",
+        dest="fuse_weights",
+        help="keep separate QKV/gate-up weights (lower memory, more GEMMs)",
+    )
+    parser.add_argument(
         "--model", required=True, help="local safetensors/tokenizer directory"
     )
     parser.add_argument(
@@ -44,6 +50,7 @@ def main():
         num_blocks=args.num_blocks,
         debug_mode=args.debug_mode,
         use_compile=args.use_compile,
+        fuse_weights=args.fuse_weights,
     )
     results = llm.generate(
         args.prompt,

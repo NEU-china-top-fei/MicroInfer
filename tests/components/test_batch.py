@@ -3,8 +3,8 @@ from dataclasses import replace
 import pytest
 import torch
 
-from microinfer.engine.contracts import ScheduledSequence, SchedulerOutput
-from microinfer.worker.batch import prepare_batch
+from tests.support.batch import prepare_batch
+from tests.support.contracts import ScheduledSequence, SchedulerOutput
 
 pytestmark = [pytest.mark.component, pytest.mark.extension]
 

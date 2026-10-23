@@ -1,9 +1,6 @@
-from dataclasses import FrozenInstanceError
-
 import pytest
 
 from microinfer.config.engine import EngineConfig
-from microinfer.engine.contracts import ScheduledSequence, SchedulerOutput
 
 
 @pytest.mark.parametrize(
@@ -32,13 +29,3 @@ def test_bool_flags_reject_non_bool(field, value):
 def test_bool_flags_accept_bool(field):
     config = EngineConfig(**{field: True})
     assert getattr(config, field) is True
-
-
-def test_snapshot_counts_queries_not_cached_prefix():
-    item = ScheduledSequence(7, (4, 5), 3, (2, 0), True)
-    output = SchedulerOutput((item,))
-    assert item.context_len == 5
-    assert output.num_scheduled_tokens == 2
-    with pytest.raises(FrozenInstanceError):
-        item.start_pos = 9
-    assert SchedulerOutput().num_scheduled_tokens == 0

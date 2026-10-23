@@ -22,9 +22,8 @@ class LLMEngine:
             tokens = self.model_runner.run(seqs, prefill)
         except Exception:
             # KV may have been partially written. Abort before publishing hashes.
-            if hasattr(self.scheduler, "abort"):
-                for seq in seqs:
-                    self.scheduler.abort(seq.seq_id)
+            for seq in seqs:
+                self.scheduler.abort(seq.seq_id)
             raise
         self.scheduler.postprocess(seqs, tokens, prefill)
         return [

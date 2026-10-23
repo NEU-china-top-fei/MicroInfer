@@ -19,6 +19,9 @@ Transformers 未安装时，独立参考测试会明确跳过；安装 test extr
 | model/ | Qwen3 模块注册、前向与 LM head |
 | components/ | Scheduler、KV 存储、paged attention、Runner、加载与输入输出契约 |
 | integration/ | 独立 Transformers 数值对照、真实引擎生成、失败恢复与容量边界 |
+| support/ | 测试专用 adapter：packed batch、严格 paged-attention 校验、RoPE 参考算子、KV gather、strict state_dict loader |
+
+`tests/support/` 中的代码不进入 `microinfer` 运行时包，避免生产模块承载测试接口。
 
 `tests/components/test_bench.py` 只覆盖 benchmark 的 workload 生成、指标插值和计时契约，
 不加载模型。真实吞吐基线用 `bench/` 运行，见 [基准测试](../docs/benchmarks.md)。

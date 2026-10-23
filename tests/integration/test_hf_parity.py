@@ -10,7 +10,6 @@ from microinfer.llm import LLM
 from microinfer.model.loader import load_model
 from microinfer.model.qwen3 import QwenModel
 from microinfer.runner import ModelRunner
-from microinfer.utils.context import reset_context
 
 pytestmark = pytest.mark.integration
 
@@ -37,6 +36,7 @@ def pair(tmp_path):
     reference.save_pretrained(tmp_path)
     model = QwenModel(QwenConfig.from_hf(config.to_dict())).eval()
     load_model(model, tmp_path)
+    model.fuse_weights()
     return model, reference
 
 
@@ -52,32 +52,29 @@ def test_dense_chunked_decode_and_prefix_reuse_match_transformers(pair):
     cache = runner.allocate_kv_cache(4)
     seq = Sequence(tokens[0].tolist())
     seq.block_size, seq.block_table = 2, [2, 0, 3]
-    try:
-        for start, end, prefill in [(0, 3, True), (3, 5, True), (5, 6, False)]:
-            seq.num_cached_tokens = start
-            seq.num_scheduled_tokens = end - start
-            inputs = (
-                runner.prepare_prefill([seq])
-                if prefill
-                else runner.prepare_decode([seq])
-            )
-            result = runner.run_model(*inputs, prefill)
-            torch.testing.assert_close(
-                result[0], expected[0, end - 1], atol=1e-5, rtol=1e-4
-            )
-        prefix = cache.keys[:, 2].clone()
-        other = Sequence([1, 2, 7])
-        other.block_table, other.num_cached_tokens, other.num_scheduled_tokens = (
-            [2, 1],
-            2,
-            1,
+    for start, end, prefill in [(0, 3, True), (3, 5, True), (5, 6, False)]:
+        seq.num_cached_tokens = start
+        seq.num_scheduled_tokens = end - start
+        if prefill:
+            ids, positions, metadata = runner.prepare_prefill([seq])
+        else:
+            ids, positions, metadata = runner.prepare_decode([seq])
+        result = runner.run_model(ids, positions, prefill, metadata)
+        torch.testing.assert_close(
+            result[0], expected[0, end - 1], atol=1e-5, rtol=1e-4
         )
-        result = runner.run_model(*runner.prepare_prefill([other]), True)
-        oracle = reference(torch.tensor([[1, 2, 7]]), use_cache=False).logits
-        torch.testing.assert_close(result[0], oracle[0, -1], atol=1e-5, rtol=1e-4)
-        torch.testing.assert_close(prefix, cache.keys[:, 2])
-    finally:
-        reset_context()
+    prefix = cache.keys[:, 2].clone()
+    other = Sequence([1, 2, 7])
+    other.block_table, other.num_cached_tokens, other.num_scheduled_tokens = (
+        [2, 1],
+        2,
+        1,
+    )
+    ids, positions, metadata = runner.prepare_prefill([other])
+    result = runner.run_model(ids, positions, True, metadata)
+    oracle = reference(torch.tensor([[1, 2, 7]]), use_cache=False).logits
+    torch.testing.assert_close(result[0], oracle[0, -1], atol=1e-5, rtol=1e-4)
+    torch.testing.assert_close(prefix, cache.keys[:, 2])
 
 
 class Tokenizer:

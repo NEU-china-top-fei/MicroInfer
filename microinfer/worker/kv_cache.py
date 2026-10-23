@@ -47,10 +47,6 @@ class LayerKVCache:
         blocks, offsets = indices // self.block_size, indices % self.block_size
         self.write_fast(blocks, offsets, k, v)
 
-    def write(self, slots, keys, values):
-        """Backward-compatible checked entry point for tests/tools."""
-        self.write_checked(slots, keys, values)
-
     def write_fast(self, blocks, offsets, keys, values):
         """Hot path: caller guarantees valid, unique slots and matching dtype.
 
@@ -59,26 +55,6 @@ class LayerKVCache:
         """
         self.keys[blocks, offsets] = keys
         self.values[blocks, offsets] = values
-
-    def gather(self, block_table, context_len):
-        """Reference/debug helper; paged kernels read the layer tensors directly."""
-        table = torch.as_tensor(block_table, dtype=torch.long, device=self.keys.device)
-        if (
-            table.ndim != 1
-            or context_len < 0
-            or context_len > table.numel() * self.block_size
-        ):
-            raise ValueError("invalid context length or block table")
-        count = (context_len + self.block_size - 1) // self.block_size
-        used = table[:count]
-        if torch.any(used < 0) or torch.any(used >= self.keys.shape[0]):
-            raise ValueError("block outside cache")
-        shape = (-1, *self.keys.shape[2:])
-        return (
-            self.keys[used].reshape(shape)[:context_len],
-            self.values[used].reshape(shape)[:context_len],
-        )
-
 
 class KVCache:
     def __init__(
@@ -117,10 +93,3 @@ class KVCache:
         if not 0 <= index < self.num_layers:
             raise ValueError("layer outside cache")
         return LayerKVCache(self.keys[index], self.values[index])
-
-    # Compatibility for pool-level tests/tools. Attention uses LayerKVCache only.
-    def write(self, layer, slots, keys, values):
-        self.layer(layer).write(slots, keys, values)
-
-    def gather(self, layer, block_table, context_len):
-        return self.layer(layer).gather(block_table, context_len)

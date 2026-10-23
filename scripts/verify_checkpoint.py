@@ -23,7 +23,6 @@ def main():
 
     from microinfer import LLM, SampleParameter
     from microinfer.engine.sequence import Sequence
-    from microinfer.utils.context import reset_context
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model, local_files_only=True, trust_remote_code=False
@@ -70,26 +69,22 @@ def main():
         seq.block_size = 4
         seq.block_table = list(range((len(seq) + 3) // 4))
         chunk_errors = []
-        try:
-            start = 0
-            for end in [2, len(seq) - 1, len(seq)]:
-                if end <= start:
-                    continue
-                seq.num_cached_tokens, seq.num_scheduled_tokens = start, end - start
-                prefill = end != len(seq)
-                inputs = (
-                    runner.prepare_prefill([seq])
-                    if prefill
-                    else runner.prepare_decode([seq])
-                )
-                logits = runner.run_model(*inputs, prefill)[0].cpu()
-                torch.testing.assert_close(
-                    logits, expected[0, end - 1], atol=2e-4, rtol=2e-4
-                )
-                chunk_errors.append(float((logits - expected[0, end - 1]).abs().max()))
-                start = end
-        finally:
-            reset_context()
+        start = 0
+        for end in [2, len(seq) - 1, len(seq)]:
+            if end <= start:
+                continue
+            seq.num_cached_tokens, seq.num_scheduled_tokens = start, end - start
+            prefill = end != len(seq)
+            if prefill:
+                ids_chunk, positions, metadata = runner.prepare_prefill([seq])
+            else:
+                ids_chunk, positions, metadata = runner.prepare_decode([seq])
+            logits = runner.run_model(ids_chunk, positions, prefill, metadata)[0].cpu()
+            torch.testing.assert_close(
+                logits, expected[0, end - 1], atol=2e-4, rtol=2e-4
+            )
+            chunk_errors.append(float((logits - expected[0, end - 1]).abs().max()))
+            start = end
         outputs = llm.generate(
             [ids[0].tolist()],
             SampleParameter(max_tokens=3, greedy=True, ignore_eos=True),

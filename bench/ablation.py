@@ -86,6 +86,12 @@ def main() -> int:
     parser.add_argument("--cache-mode", choices=("cold", "warm"), default="cold")
     parser.add_argument("--debug-mode", action="store_true")
     parser.add_argument("--use-compile", action="store_true")
+    parser.add_argument(
+        "--no-fuse-weights",
+        action="store_false",
+        dest="fuse_weights",
+        help="keep separate QKV/gate-up weights (lower memory)",
+    )
     parser.add_argument("--csv", default="results/bench/ablation.csv")
     parser.add_argument(
         "--raw-dir",
@@ -138,6 +144,8 @@ def main() -> int:
         command.append("--debug-mode")
     if args.use_compile:
         command.append("--use-compile")
+    if not args.fuse_weights:
+        command.append("--no-fuse-weights")
 
     print("command:", " ".join(command), flush=True)
     result = subprocess.run(command, cwd=PROJECT_ROOT, check=False)
@@ -162,23 +170,23 @@ def main() -> int:
             writer.writeheader()
         writer.writerows(rows)
 
+    def fmt(row, key, digits=1):
+        value = row[key]
+        return "-" if value is None else f"{value:.{digits}f}"
+
     print()
     print(
-        f"| label | workload | out tok/s | TTFT p50 ms | TTFT p99 ms | "
-        f"TPOT p50 ms | peak MB | prefix hit |"
+        "| label | workload | out tok/s | TTFT p50 ms | TTFT p99 ms | "
+        "TPOT p50 ms | peak MB | prefix hit |"
     )
     print("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |")
     for row in rows:
-        def fmt(key, digits=1):
-            value = row[key]
-            return "-" if value is None else f"{value:.{digits}f}"
-
         hit = row["prefix_hit_rate"]
         hit = "-" if hit is None else f"{hit * 100:.1f}%"
         print(
-            f"| {row['label']} | {row['workload']} | {fmt('output_tps')} | "
-            f"{fmt('ttft_p50_ms')} | {fmt('ttft_p99_ms')} | "
-            f"{fmt('tpot_p50_ms')} | {fmt('peak_alloc_mb', 0)} | {hit} |"
+            f"| {row['label']} | {row['workload']} | {fmt(row, 'output_tps')} | "
+            f"{fmt(row, 'ttft_p50_ms')} | {fmt(row, 'ttft_p99_ms')} | "
+            f"{fmt(row, 'tpot_p50_ms')} | {fmt(row, 'peak_alloc_mb', 0)} | {hit} |"
         )
     print(f"\nablation log: {csv_path}")
     if temporary is not None:

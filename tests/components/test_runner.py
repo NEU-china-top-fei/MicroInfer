@@ -4,16 +4,8 @@ from torch import nn
 from torch.nn import functional as F
 
 from microinfer.runner import ModelRunner
-from microinfer.utils.context import get_context, reset_context
 
 pytestmark = [pytest.mark.component, pytest.mark.nano]
-
-
-@pytest.fixture(autouse=True)
-def clear_context():
-    reset_context()
-    yield
-    reset_context()
 
 
 class ToyModel(nn.Module):
@@ -27,12 +19,9 @@ class ToyModel(nn.Module):
         return F.one_hot((input_ids + 1) % 16, 16).float()
 
     def compute_logits(self, hidden, metadata=None):
-        context = get_context()
-        return (
-            hidden[context.cu_seqlens_q[1:].long() - 1]
-            if context.is_prefill
-            else hidden
-        )
+        if metadata is not None and metadata.is_prefill:
+            return hidden[metadata.cu_seqlens_q[1:].long() - 1]
+        return hidden
 
 
 class ArgmaxSampler:
@@ -49,27 +38,25 @@ def test_prepare_prefill_with_prefix_cache(sequence_cls):
     a.num_cached_tokens, a.num_scheduled_tokens, a.block_table = 3, 3, [2, 0]
     b.num_scheduled_tokens, b.block_table = 2, [5]
     runner = ModelRunner(None, None, None, block_size=4)
-    ids, positions = runner.prepare_prefill([a, b])
-    context = get_context()
+    ids, positions, metadata = runner.prepare_prefill([a, b])
     assert ids.tolist() == [13, 14, 15, 24, 25]
     assert positions.tolist() == [3, 4, 5, 0, 1]
-    assert context.is_prefill
-    assert context.cu_seqlens_q.tolist() == [0, 3, 5]
-    assert context.cu_seqlens_k.tolist() == [0, 6, 8]
-    assert (context.max_seqlen_q, context.max_seqlen_k) == (3, 6)
-    assert context.slot_mapping.tolist() == [11, 0, 1, 20, 21]
-    assert context.slot_mapping.dtype == torch.int32
-    assert context.block_tables.tolist() == [[2, 0], [5, -1]]
-    assert context.context_lens is None
+    assert metadata.is_prefill
+    assert metadata.cu_seqlens_q.tolist() == [0, 3, 5]
+    assert metadata.cu_seqlens_k.tolist() == [0, 6, 8]
+    assert (metadata.max_seqlen_q, metadata.max_seqlen_k) == (3, 6)
+    assert metadata.slot_mapping.tolist() == [11, 0, 1, 20, 21]
+    assert metadata.slot_mapping.dtype == torch.int32
+    assert metadata.block_tables.tolist() == [[2, 0], [5, -1]]
+    assert metadata.context_lens is None
 
 
 def test_prepare_prefill_without_cache_needs_no_block_table(sequence_cls):
     seq = sequence_cls([1, 2])
     seq.num_scheduled_tokens, seq.block_table = 2, [0]
-    ModelRunner(None, None, None, block_size=4).prepare_prefill([seq])
-    context = get_context()
-    assert context.block_tables is None
-    assert context.cu_seqlens_k.tolist() == context.cu_seqlens_q.tolist() == [0, 2]
+    _, _, metadata = ModelRunner(None, None, None, block_size=4).prepare_prefill([seq])
+    assert metadata.block_tables is None
+    assert metadata.cu_seqlens_k.tolist() == metadata.cu_seqlens_q.tolist() == [0, 2]
 
 
 def test_prepare_decode_uses_one_last_token_per_sequence(sequence_cls):
@@ -77,14 +64,15 @@ def test_prepare_decode_uses_one_last_token_per_sequence(sequence_cls):
     a.block_table, b.block_table = [2, 0], [1]
     a.num_cached_tokens, b.num_cached_tokens = 4, 1
     a.num_scheduled_tokens = b.num_scheduled_tokens = 1
-    ids, positions = ModelRunner(None, None, None, block_size=4).prepare_decode([a, b])
-    context = get_context()
+    ids, positions, metadata = ModelRunner(
+        None, None, None, block_size=4
+    ).prepare_decode([a, b])
     assert ids.tolist() == [5, 8] and positions.tolist() == [4, 1]
-    assert not context.is_prefill
-    assert context.context_lens.tolist() == [5, 2]
-    assert context.slot_mapping.tolist() == [0, 5]
-    assert context.block_tables.tolist() == [[2, 0], [1, -1]]
-    assert context.cu_seqlens_q is context.cu_seqlens_k is None
+    assert not metadata.is_prefill
+    assert metadata.context_lens.tolist() == [5, 2]
+    assert metadata.slot_mapping.tolist() == [0, 5]
+    assert metadata.block_tables.tolist() == [[2, 0], [1, -1]]
+    assert metadata.cu_seqlens_q is metadata.cu_seqlens_k is None
 
 
 def test_runner_returns_positional_samples_even_for_incomplete_chunk(sequence_cls):
@@ -95,7 +83,6 @@ def test_runner_returns_positional_samples_even_for_incomplete_chunk(sequence_cl
     assert runner.run([seq], True) == [4]
     assert seq.token_ids == [1, 2, 3, 4, 5] and seq.num_cached_tokens == 0
     assert sampler.calls[0][0].shape == (1, 16)
-    assert get_context().slot_mapping is None
 
 
 def test_run_preserves_sequence_order(sequence_cls):
@@ -117,7 +104,7 @@ def test_empty_work_skips_model(sequence_cls):
 
 
 @pytest.mark.extension
-def test_exception_cleanup_clears_context(sequence_cls):
+def test_exception_propagates(sequence_cls):
     class BrokenModel(ToyModel):
         def forward(self, ids, positions, metadata=None):
             raise RuntimeError("execution failed")
@@ -125,15 +112,16 @@ def test_exception_cleanup_clears_context(sequence_cls):
     seq = sequence_cls([1])
     seq.num_scheduled_tokens, seq.block_table = 1, [0]
     with pytest.raises(RuntimeError, match="execution failed"):
-        ModelRunner(BrokenModel(), None, ArgmaxSampler(), block_size=4).run([seq], True)
-    assert get_context().slot_mapping is None
+        ModelRunner(BrokenModel(), None, ArgmaxSampler(), block_size=4).run(
+            [seq], True
+        )
 
 
 def test_debug_validation_accepts_consistent_prefill(sequence_cls):
     seq = sequence_cls([1, 2, 3, 4])
     seq.num_scheduled_tokens, seq.block_table = 4, [0]
     runner = ModelRunner(None, None, None, block_size=4, debug_mode=True)
-    ids, positions = runner.prepare_prefill([seq])
+    ids, positions, _ = runner.prepare_prefill([seq])
     assert ids.tolist() == [1, 2, 3, 4]
     assert positions.tolist() == [0, 1, 2, 3]
 
@@ -144,7 +132,7 @@ def test_debug_validation_accepts_consistent_decode(sequence_cls):
     seq.num_scheduled_tokens = 1
     seq.block_table = [0, 1]
     runner = ModelRunner(None, None, None, block_size=4, debug_mode=True)
-    ids, positions = runner.prepare_decode([seq])
+    ids, positions, _ = runner.prepare_decode([seq])
     assert ids.tolist() == [5]
     assert positions.tolist() == [4]
 
@@ -163,7 +151,7 @@ def test_debug_mode_off_skips_runner_validation(sequence_cls):
     for seq in (a, b):
         seq.num_scheduled_tokens, seq.block_table = 2, [0]
     runner = ModelRunner(None, None, None, block_size=4, debug_mode=False)
-    ids, _ = runner.prepare_prefill([a, b])
+    ids, _, _ = runner.prepare_prefill([a, b])
     assert ids.tolist() == [1, 2, 3, 4]
 
 
@@ -196,13 +184,11 @@ def test_compile_is_decode_only():
     assert runner._forward_for(False) is runner._compiled_forward
 
 
-def test_prepare_attaches_attention_metadata(sequence_cls):
+def test_prepare_returns_attention_metadata(sequence_cls):
     seq = sequence_cls([1, 2])
     seq.num_scheduled_tokens, seq.block_table = 2, [0]
     runner = ModelRunner(None, None, None, block_size=4)
-    runner.prepare_prefill([seq])
-    metadata = get_context().metadata
-    assert metadata is not None
+    _, _, metadata = runner.prepare_prefill([seq])
     assert metadata.is_prefill and metadata.direct_prefill
     assert metadata.cu_q_cpu == (0, 2)
     assert metadata.q_lens_cpu == (2,)

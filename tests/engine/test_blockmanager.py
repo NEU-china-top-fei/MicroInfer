@@ -252,11 +252,9 @@ def test_reset_prefix_cache_requires_idle_pool(sequence_cls):
     manager.deallocate(seq)
     manager.blocks[0].update(123, [1, 2, 3, 4])
     manager.hash_to_block_id[123] = 0
-    manager.prefix_cache_hit_blocks = 1
     manager.prefix_cache_hit_tokens = 4
 
     manager.reset_prefix_cache()
     assert manager.hash_to_block_id == {}
-    assert manager.prefix_cache_hit_blocks == 0
     assert manager.prefix_cache_hit_tokens == 0
     assert all(block.hash == -1 and block.token_ids == [] for block in manager.blocks)

@@ -8,6 +8,7 @@ per step instead of once per layer.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import pairwise
 
 import torch
 
@@ -45,7 +46,7 @@ class AttentionMetadata:
         context_lens=None,
         block_tables=None,
         validate_cache_write: bool = True,
-    ) -> "AttentionMetadata":
+    ) -> AttentionMetadata:
         return cls(
             is_prefill=is_prefill,
             cu_seqlens_q=cu_seqlens_q,
@@ -57,29 +58,6 @@ class AttentionMetadata:
             block_tables=block_tables,
             direct_prefill=is_prefill and block_tables is None,
             validate_cache_write=validate_cache_write,
-        )
-
-    @classmethod
-    def from_context(cls, context=None) -> "AttentionMetadata":
-        if context is None:
-            from microinfer.utils.context import get_context
-
-            context = get_context()
-        existing = getattr(context, "metadata", None)
-        if existing is not None:
-            return existing
-        return cls.build(
-            is_prefill=context.is_prefill,
-            cu_seqlens_q=context.cu_seqlens_q,
-            cu_seqlens_k=context.cu_seqlens_k,
-            max_seqlen_q=context.max_seqlen_q,
-            max_seqlen_k=context.max_seqlen_k,
-            slot_mapping=context.slot_mapping,
-            context_lens=context.context_lens,
-            block_tables=context.block_tables,
-            # Context-based calls are tests/direct adapters: keep the checked
-            # cache write unless the caller passes an explicit metadata object.
-            validate_cache_write=True,
         )
 
     @property
@@ -125,9 +103,7 @@ class AttentionMetadata:
                 )
             elif self.cu_seqlens_k is not None:
                 lengths = [int(x) for x in self.cu_seqlens_k.tolist()]
-                self._context_lens_cpu = tuple(
-                    b - a for a, b in zip(lengths, lengths[1:])
-                )
+                self._context_lens_cpu = tuple(b - a for a, b in pairwise(lengths))
             else:
                 self._context_lens_cpu = ()
         return self._context_lens_cpu
@@ -136,9 +112,5 @@ class AttentionMetadata:
     def q_lens_cpu(self) -> tuple[int, ...]:
         if self._q_lens_cpu is None:
             cu = self.cu_q_cpu
-            self._q_lens_cpu = tuple(b - a for a, b in zip(cu, cu[1:]))
+            self._q_lens_cpu = tuple(b - a for a, b in pairwise(cu))
         return self._q_lens_cpu
-
-    @property
-    def num_requests(self) -> int:
-        return len(self.q_lens_cpu)

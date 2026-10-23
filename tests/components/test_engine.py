@@ -51,6 +51,9 @@ def test_execution_error_does_not_postprocess(sequence_cls):
         def postprocess(self, *args):
             pytest.fail("failed KV was committed")
 
+        def abort(self, seq_id):
+            pass
+
     class RunnerSpy:
         def run(self, *args):
             raise RuntimeError("device failure")

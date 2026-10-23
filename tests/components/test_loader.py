@@ -2,7 +2,7 @@ import pytest
 import torch
 from torch import nn
 
-from microinfer.model.loader import load_weights
+from tests.support.loader import load_weights
 
 pytestmark = [pytest.mark.component, pytest.mark.extension]
 
