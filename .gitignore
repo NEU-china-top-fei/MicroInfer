@@ -196,6 +196,12 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Profiling outputs (large; regenerate with bench.profile_runner)
+*.nsys-rep
+*.nsys.sqlite
+*.pt.trace.json
+*.pt.trace.json.gz
+
 # Private handoff notes, local models, and generated validation artifacts
 /.local/
 /models/

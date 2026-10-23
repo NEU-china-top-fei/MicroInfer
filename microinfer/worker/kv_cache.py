@@ -25,8 +25,8 @@ class LayerKVCache:
     def block_size(self):
         return self.keys.shape[1]
 
-    def write(self, slots, keys, values):
-        """Write [T,Hkv,D]; -1 skips padding. Validate before changing storage."""
+    def write_checked(self, slots, keys, values):
+        """Checked write: -1 skips padding; validates before changing storage."""
         if slots.ndim != 1 or slots.dtype not in (torch.int32, torch.int64):
             raise ValueError("slots must be a 1-D integer tensor")
         expected = (slots.numel(), *self.keys.shape[2:])
@@ -45,8 +45,20 @@ class LayerKVCache:
         k = keys[valid].to(self.keys.dtype)
         v = values[valid].to(self.values.dtype)
         blocks, offsets = indices // self.block_size, indices % self.block_size
-        self.keys[blocks, offsets] = k
-        self.values[blocks, offsets] = v
+        self.write_fast(blocks, offsets, k, v)
+
+    def write(self, slots, keys, values):
+        """Backward-compatible checked entry point for tests/tools."""
+        self.write_checked(slots, keys, values)
+
+    def write_fast(self, blocks, offsets, keys, values):
+        """Hot path: caller guarantees valid, unique slots and matching dtype.
+
+        ``blocks``/``offsets`` are precomputed once per step in
+        ``AttentionMetadata.slot_indices`` and reused by every layer.
+        """
+        self.keys[blocks, offsets] = keys
+        self.values[blocks, offsets] = values
 
     def gather(self, block_table, context_len):
         """Reference/debug helper; paged kernels read the layer tensors directly."""

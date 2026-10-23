@@ -17,6 +17,7 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
+    metadata: object | None = None
 
 
 _EMPTY = Context()
@@ -36,6 +37,7 @@ def set_context(
     slot_mapping=None,
     context_lens=None,
     block_tables=None,
+    metadata=None,
 ):
     _CONTEXT.set(
         Context(
@@ -47,6 +49,7 @@ def set_context(
             slot_mapping,
             context_lens,
             block_tables,
+            metadata,
         )
     )
 

@@ -21,14 +21,15 @@ class Scheduler:
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
-        if seq.status != SequenceStatus.WAITING or any(
-            s.seq_id == seq.seq_id for s in (*self.waiting, *self.running)
-        ):
-            raise ValueError("request already admitted or finished")
-        if not seq.token_ids or seq.max_tokens <= 0 or len(seq) >= self.max_length:
-            raise ValueError("prompt/generation length exceeds engine capacity")
-        if seq.block_table:
-            raise ValueError("new request already owns cache blocks")
+        if self.config.debug_mode:
+            if seq.status != SequenceStatus.WAITING or any(
+                s.seq_id == seq.seq_id for s in (*self.waiting, *self.running)
+            ):
+                raise ValueError("request already admitted or finished")
+            if not seq.token_ids or seq.max_tokens <= 0 or len(seq) >= self.max_length:
+                raise ValueError("prompt/generation length exceeds engine capacity")
+            if seq.block_table:
+                raise ValueError("new request already owns cache blocks")
         seq.block_size = self.block_size
         self.waiting.append(seq)
 
@@ -110,10 +111,11 @@ class Scheduler:
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
-        if self._inflight != (seqs, is_prefill) or len(seqs) != len(token_ids):
-            raise ValueError("postprocess does not match scheduled work")
-        if any(type(t) is not int or t < 0 for t in token_ids):
-            raise ValueError("invalid sampled token")
+        if self.config.debug_mode:
+            if self._inflight != (seqs, is_prefill) or len(seqs) != len(token_ids):
+                raise ValueError("postprocess does not match scheduled work")
+            if any(type(t) is not int or t < 0 for t in token_ids):
+                raise ValueError("invalid sampled token")
         for seq, token_id in zip(seqs, token_ids):
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens

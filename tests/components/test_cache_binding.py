@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from microinfer.layer.cached_attention import CachedAttention
+from microinfer.layer.metadata import AttentionMetadata
 from microinfer.runner import ModelRunner
 from microinfer.utils.context import reset_context, set_context
 from microinfer.worker.kv_cache import KVCache
@@ -136,6 +137,39 @@ def test_no_prefix_prefill_isolates_requests_without_cache(seeded_torch):
         True, cu_seqlens_q=torch.tensor([0, 3, 5]), cu_seqlens_k=torch.tensor([0, 3, 5])
     )
     actual = CachedAttention()(q, k, v)
+    expected = torch.cat(
+        [dense_reference(q[:3], k[:3], v[:3]), dense_reference(q[3:], k[3:], v[3:])]
+    )
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_explicit_metadata_uses_fast_cache_write(seeded_torch):
+    q, k, v = torch.randn(3, 4, 4), torch.randn(3, 2, 4), torch.randn(3, 2, 4)
+    pool = KVCache(1, 2, 4, 2, 4)
+    backend = CachedAttention()
+    backend.bind_cache(pool.layer(0))
+    metadata = AttentionMetadata.build(
+        is_prefill=True,
+        cu_seqlens_q=torch.tensor([0, 3]),
+        cu_seqlens_k=torch.tensor([0, 3]),
+        slot_mapping=torch.tensor([0, 1, 2]),
+        validate_cache_write=False,
+    )
+    actual = backend(q, k, v, metadata)
+    expected = dense_reference(q, k, v)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(pool.layer(0).keys[0, :3], k)
+    torch.testing.assert_close(pool.layer(0).values[0, :3], v)
+
+
+def test_explicit_metadata_prefill_does_not_need_context(seeded_torch):
+    q, k, v = torch.randn(5, 4, 4), torch.randn(5, 2, 4), torch.randn(5, 2, 4)
+    metadata = AttentionMetadata.build(
+        is_prefill=True,
+        cu_seqlens_q=torch.tensor([0, 3, 5]),
+        cu_seqlens_k=torch.tensor([0, 3, 5]),
+    )
+    actual = CachedAttention()(q, k, v, metadata)
     expected = torch.cat(
         [dense_reference(q[:3], k[:3], v[:3]), dense_reference(q[3:], k[3:], v[3:])]
     )

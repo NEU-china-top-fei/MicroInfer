@@ -1,6 +1,7 @@
 """Synchronous text/token generation over the MicroInfer engine."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from threading import Lock
 
@@ -19,7 +20,15 @@ class LLM:
 
     @classmethod
     def from_model(
-        cls, model, tokenizer, *, block_size=16, num_blocks=64, engine_config=None
+        cls,
+        model,
+        tokenizer,
+        *,
+        block_size=16,
+        num_blocks=64,
+        engine_config=None,
+        debug_mode=None,
+        use_compile=None,
     ):
         from microinfer.engine.blockmanager import BlockManager
         from microinfer.engine.llm_engine import LLMEngine
@@ -31,6 +40,13 @@ class LLM:
             max_model_len=min(model.config.max_pos_embed, block_size * num_blocks),
             eos_token_id=getattr(tokenizer, "eos_token_id", None),
         )
+        overrides = {}
+        if debug_mode is not None:
+            overrides["debug_mode"] = debug_mode
+        if use_compile is not None:
+            overrides["use_compile"] = use_compile
+        if overrides:
+            config = replace(config, **overrides)
         if config.max_model_len > model.config.max_pos_embed:
             raise ValueError("engine context exceeds model position limit")
         runner = ModelRunner(
@@ -39,6 +55,8 @@ class LLM:
             Sampler(),
             block_size=block_size,
             device=model.embedding.weight.device,
+            debug_mode=config.debug_mode,
+            use_compile=config.use_compile,
         )
         runner.allocate_kv_cache(num_blocks)
         scheduler = Scheduler(config, BlockManager(num_blocks, block_size))
@@ -62,6 +80,8 @@ class LLM:
         block_size=16,
         num_blocks=64,
         engine_config=None,
+        debug_mode=None,
+        use_compile=None,
     ):
         """Load a local Qwen3 directory. Never downloads or executes remote code."""
         import torch
@@ -98,6 +118,8 @@ class LLM:
             block_size=block_size,
             num_blocks=num_blocks,
             engine_config=engine_config,
+            debug_mode=debug_mode,
+            use_compile=use_compile,
         )
 
     def generate(self, prompts, sampling_params=None, use_tqdm=True):

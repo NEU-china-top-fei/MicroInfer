@@ -141,7 +141,18 @@ python -m bench.report --input-dir results/bench
 | long-prefill | 21.7 | 56.9 | 93.0 |
 
 默认使用 cold cache；`--cache-mode warm` 用于观察重复 workload 的前缀缓存稳态收益。
-完整结果、profiling 热点和对比口径见 [docs/benchmarks.md](docs/benchmarks.md)。
+profiling 默认输出 Chrome/Perfetto JSON + TensorBoard trace，`--export nsys` 输出
+可直接用 Nsight Systems 打开的 `.nsys-rep`：
+
+```bash
+python -m bench.profile_runner --model /path/to/Qwen3-0.6B \
+  --workload single-short --max-tokens 8 --export torch
+python -m bench.profile_runner --model /path/to/Qwen3-0.6B \
+  --workload single-short --max-tokens 1 --export nsys
+```
+
+完整结果、profiling 热点和可视化方式见 [docs/benchmarks.md](docs/benchmarks.md)；
+P1 的 `debug_mode` / `use_compile` 开关和消融记录见 [docs/p1.md](docs/p1.md)。
 这是后续优化的起点，不是最终性能。
 
 ## 参考项目

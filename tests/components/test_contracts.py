@@ -21,6 +21,19 @@ def test_eos_rejects_invalid_ids(value):
         EngineConfig(eos_token_id=value)
 
 
+@pytest.mark.parametrize("field", ["debug_mode", "use_compile"])
+@pytest.mark.parametrize("value", [0, 1, 1.0, "true", None])
+def test_bool_flags_reject_non_bool(field, value):
+    with pytest.raises(ValueError, match=field):
+        EngineConfig(**{field: value})
+
+
+@pytest.mark.parametrize("field", ["debug_mode", "use_compile"])
+def test_bool_flags_accept_bool(field):
+    config = EngineConfig(**{field: True})
+    assert getattr(config, field) is True
+
+
 def test_snapshot_counts_queries_not_cached_prefix():
     item = ScheduledSequence(7, (4, 5), 3, (2, 0), True)
     output = SchedulerOutput((item,))

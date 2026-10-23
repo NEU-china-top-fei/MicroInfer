@@ -9,6 +9,10 @@ class EngineConfig:
     max_num_batched_tokens: int = 512
     max_model_len: int = 4096
     eos_token_id: int | None = None
+    # P1 safety net: keep expensive invariant checks on for tests/debugging.
+    debug_mode: bool = False
+    # P1.5 experiment switch; the tuned compile path is not part of P1.0.
+    use_compile: bool = False
 
     def __post_init__(self):
         for name in ("max_num_seqs", "max_num_batched_tokens", "max_model_len"):
@@ -19,3 +23,6 @@ class EngineConfig:
             type(self.eos_token_id) is not int or self.eos_token_id < 0
         ):
             raise ValueError("eos_token_id must be a nonnegative integer or None")
+        for name in ("debug_mode", "use_compile"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean")

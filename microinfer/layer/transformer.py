@@ -5,7 +5,7 @@ from torch.nn import functional as F
 
 from microinfer.layer.cached_attention import CachedAttention
 from microinfer.layer.norm import FuseLayerNorm
-from microinfer.layer.rope import rotate
+from microinfer.layer.rope import RotaryCache
 from microinfer.utils.context import get_context
 
 
@@ -25,7 +25,7 @@ class FFN(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, rotary=None):
         super().__init__()
         self.num_q_head, self.num_kv_head, self.head_dim = (
             config.num_q_head,
@@ -61,6 +61,12 @@ class Attention(nn.Module):
             config.rope_base,
             config.rope_interleaved,
         )
+        self.rotary = rotary or RotaryCache(
+            config.max_pos_embed,
+            self.head_dim,
+            config.rope_base,
+            interleaved=config.rope_interleaved,
+        )
         self.attn = CachedAttention()
 
     def bind_cache(self, cache):
@@ -68,42 +74,55 @@ class Attention(nn.Module):
             raise ValueError("layer cache does not match attention heads")
         self.attn.bind_cache(cache)
 
-    def forward(self, x, position):
+    def _dense_attention(self, q, k, v):
+        # Standalone dense forward is stateless, even when a pool is bound.
+        repeats = self.num_q_head // self.num_kv_head
+        return F.scaled_dot_product_attention(
+            q.transpose(-3, -2),
+            k.repeat_interleave(repeats, dim=-2).transpose(-3, -2),
+            v.repeat_interleave(repeats, dim=-2).transpose(-3, -2),
+            is_causal=True,
+        ).transpose(-3, -2)
+
+    def forward(self, x, position, metadata=None):
         shape = x.shape[:-1]
         q = self.q_proj(x).reshape(*shape, self.num_q_head, self.head_dim)
         k = self.k_proj(x).reshape(*shape, self.num_kv_head, self.head_dim)
         v = self.v_proj(x).reshape(*shape, self.num_kv_head, self.head_dim)
         q, _ = self.q_norm(q)
         k, _ = self.k_norm(k)
-        q = rotate(q, position, self.rope_base, interleaved=self.rope_interleaved)
-        k = rotate(k, position, self.rope_base, interleaved=self.rope_interleaved)
-        ctx = get_context()
-        if x.ndim == 2 and (
-            ctx.cu_seqlens_q is not None or ctx.context_lens is not None
-        ):
-            out = self.attn(q, k, v)
+        q = self.rotary.apply(q, position)
+        k = self.rotary.apply(k, position)
+        if x.ndim == 2 and metadata is not None:
+            out = self.attn(q, k, v, metadata)
+        elif x.ndim == 2:
+            ctx = get_context()
+            if (
+                ctx.metadata is not None
+                or ctx.cu_seqlens_q is not None
+                or ctx.context_lens is not None
+            ):
+                out = self.attn(q, k, v)
+            else:
+                out = self._dense_attention(q, k, v)
         else:
-            # Standalone dense forward is stateless, even when a pool is bound.
-            repeats = self.num_q_head // self.num_kv_head
-            out = F.scaled_dot_product_attention(
-                q.transpose(-3, -2),
-                k.repeat_interleave(repeats, dim=-2).transpose(-3, -2),
-                v.repeat_interleave(repeats, dim=-2).transpose(-3, -2),
-                is_causal=True,
-            ).transpose(-3, -2)
+            out = self._dense_attention(q, k, v)
         return self.out_proj(out.reshape(*shape, self.num_q_head * self.head_dim))
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, rotary=None):
         super().__init__()
         self.pre_attention_norm = FuseLayerNorm(config)
         self.post_attention_norm = FuseLayerNorm(config)
-        self.attention = Attention(config)
+        self.attention = Attention(config, rotary)
         self.ffn = FFN(config)
 
-    def forward(self, x, position, residual=None):
+    def forward(self, x, position, residual=None, metadata=None):
         hidden, residual = self.pre_attention_norm(x, residual)
-        hidden = self.attention(hidden, position)
+        if metadata is None:
+            hidden = self.attention(hidden, position)
+        else:
+            hidden = self.attention(hidden, position, metadata)
         hidden, residual = self.post_attention_norm(hidden, residual)
         return self.ffn(hidden), residual

@@ -9,6 +9,20 @@ def main():
         description="Generate with a local Qwen3 checkpoint"
     )
     parser.add_argument(
+        "--debug-mode",
+        "--debug_mode",
+        action="store_true",
+        dest="debug_mode",
+        help="enable scheduler/runner invariant checks",
+    )
+    parser.add_argument(
+        "--use-compile",
+        "--use_compile",
+        action="store_true",
+        dest="use_compile",
+        help="compile the model forward (experimental; P1.5 tunes it)",
+    )
+    parser.add_argument(
         "--model", required=True, help="local safetensors/tokenizer directory"
     )
     parser.add_argument(
@@ -28,6 +42,8 @@ def main():
         dtype=args.dtype,
         block_size=args.block_size,
         num_blocks=args.num_blocks,
+        debug_mode=args.debug_mode,
+        use_compile=args.use_compile,
     )
     results = llm.generate(
         args.prompt,

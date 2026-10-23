@@ -57,6 +57,8 @@ def _meta(args, engine) -> dict:
         "git_commit": _git_commit(),
         "engine_meta": engine.meta,
         "cache_mode": args.cache_mode,
+        "debug_mode": args.debug_mode if args.engine == "microinfer" else False,
+        "use_compile": args.use_compile if args.engine == "microinfer" else False,
         "bench": {
             "runs": args.runs,
             "warmup": args.warmup,
@@ -120,6 +122,16 @@ def main() -> int:
         default="cold",
         help="cold: reset prefix cache per run; warm: steady-state repeated prompts",
     )
+    parser.add_argument(
+        "--debug-mode",
+        action="store_true",
+        help="enable scheduler/runner invariant checks (MicroInfer only)",
+    )
+    parser.add_argument(
+        "--use-compile",
+        action="store_true",
+        help="compile model forward (experimental; MicroInfer only)",
+    )
     parser.add_argument("--output-dir", default="results/bench")
     parser.add_argument("--tag", default="")
     parser.add_argument("--list-workloads", action="store_true")
@@ -158,6 +170,8 @@ def main() -> int:
         nano_root=args.nano_root,
         enforce_eager=args.nano_enforce_eager,
         cache_mode=args.cache_mode,
+        debug_mode=args.debug_mode,
+        use_compile=args.use_compile,
     ).load()
 
     workloads = build_workloads(names, seed=args.seed)

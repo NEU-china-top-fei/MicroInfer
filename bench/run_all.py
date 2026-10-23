@@ -32,6 +32,16 @@ def main() -> int:
         default="cold",
         help="cold resets prefix cache per run; warm measures steady state",
     )
+    parser.add_argument(
+        "--debug-mode",
+        action="store_true",
+        help="enable MicroInfer scheduler/runner invariant checks",
+    )
+    parser.add_argument(
+        "--use-compile",
+        action="store_true",
+        help="compile MicroInfer model forward (experimental)",
+    )
     parser.add_argument("--output-dir", default="results/bench")
     parser.add_argument("--skip-bs16", action="store_true")
     parser.add_argument(
@@ -84,22 +94,21 @@ def main() -> int:
         for block_size, num_blocks, tag in ((256, 64, "bs256"), (16, 1024, "bs16")):
             if tag == "bs16" and args.skip_bs16:
                 continue
-            commands.append(
-                (
-                    f"microinfer {tag}",
-                    common
-                    + [
-                        "--engine",
-                        "microinfer",
-                        "--block-size",
-                        str(block_size),
-                        "--num-blocks",
-                        str(num_blocks),
-                        "--tag",
-                        tag,
-                    ],
-                )
-            )
+            command = common + [
+                "--engine",
+                "microinfer",
+                "--block-size",
+                str(block_size),
+                "--num-blocks",
+                str(num_blocks),
+                "--tag",
+                tag,
+            ]
+            if args.debug_mode:
+                command.append("--debug-mode")
+            if args.use_compile:
+                command.append("--use-compile")
+            commands.append((f"microinfer {tag}", command))
     if "hf" in engines:
         commands.append(("hf", common + ["--engine", "hf"]))
     if "nano" in engines:

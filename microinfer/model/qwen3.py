@@ -1,7 +1,9 @@
 import torch
 from torch import nn
 
+from microinfer.layer.metadata import AttentionMetadata
 from microinfer.layer.norm import FuseLayerNorm
+from microinfer.layer.rope import RotaryCache
 from microinfer.layer.transformer import TransformerLayer
 from microinfer.utils.context import Context, get_context, use_context
 
@@ -11,26 +13,58 @@ class QwenModel(nn.Module):
         super().__init__()
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_dim)
+        self.rotary = RotaryCache(
+            config.max_pos_embed,
+            config.head_dim,
+            config.rope_base,
+            interleaved=config.rope_interleaved,
+        )
         self.transformer_layers = nn.ModuleList(
-            [TransformerLayer(config) for _ in range(config.num_hidden_layer)]
+            [
+                TransformerLayer(config, self.rotary)
+                for _ in range(config.num_hidden_layer)
+            ]
         )
         self.mid_norm = FuseLayerNorm(config)
         self.out_logits = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
         if config.tie_word_embeddings:
             self.out_logits.weight = self.embedding.weight
 
-    def forward(self, x, position):
+    def forward(self, x, position, metadata=None):
+        if metadata is None and x.ndim == 1:
+            context = get_context()
+            if (
+                context.metadata is not None
+                or context.cu_seqlens_q is not None
+                or context.context_lens is not None
+            ):
+                metadata = AttentionMetadata.from_context()
         hidden = self.embedding(x)
         residual = None
         for layer in self.transformer_layers:
-            hidden, residual = layer(hidden, position, residual)
+            if metadata is None:
+                hidden, residual = layer(hidden, position, residual)
+            else:
+                hidden, residual = layer(hidden, position, residual, metadata)
         hidden, _ = self.mid_norm(hidden, residual)
         return hidden
 
-    def compute_logits(self, hidden):
-        context = get_context()
-        if hidden.ndim == 2 and context.is_prefill and context.cu_seqlens_q is not None:
-            hidden = hidden[context.cu_seqlens_q[1:].long() - 1]
+    def compute_logits(self, hidden, metadata=None):
+        if metadata is None and hidden.ndim == 2:
+            context = get_context()
+            if (
+                context.metadata is not None
+                or context.cu_seqlens_q is not None
+                or context.context_lens is not None
+            ):
+                metadata = AttentionMetadata.from_context()
+        if (
+            hidden.ndim == 2
+            and metadata is not None
+            and metadata.is_prefill
+            and metadata.cu_seqlens_q is not None
+        ):
+            hidden = hidden[metadata.cu_seqlens_q[1:].long() - 1]
         return self.out_logits(hidden)
 
     def forward_batch(self, batch):

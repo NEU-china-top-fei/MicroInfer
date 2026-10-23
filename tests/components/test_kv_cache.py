@@ -48,6 +48,20 @@ def test_invalid_gather_rejected(table, length):
         cache.gather(0, table, length)
 
 
+def test_fast_write_matches_checked_write():
+    checked = KVCache(1, 2, 4, 1, 2)
+    fast = KVCache(1, 2, 4, 1, 2)
+    keys = torch.randn(3, 1, 2)
+    values = torch.randn(3, 1, 2)
+    slots = torch.tensor([0, 1, 2])
+
+    checked.write(0, slots, keys, values)
+    fast.layer(0).write_fast(slots // 4, slots % 4, keys, values)
+
+    torch.testing.assert_close(checked.keys, fast.keys)
+    torch.testing.assert_close(checked.values, fast.values)
+
+
 def test_storage_preserves_dtype_and_device(device):
     cache = KVCache(1, 2, 4, 1, 2, dtype=torch.float16, device=device)
     keys = torch.ones(1, 1, 2, dtype=torch.float16, device=device)

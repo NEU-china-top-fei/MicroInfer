@@ -32,10 +32,16 @@ class MicroInferEngine:
         max_num_batched_tokens=8192,
         max_model_len=4096,
         cache_mode="cold",
+        debug_mode=False,
+        use_compile=False,
     ):
         if cache_mode not in ("cold", "warm"):
             raise ValueError("cache_mode must be cold or warm")
+        if type(debug_mode) is not bool or type(use_compile) is not bool:
+            raise ValueError("debug_mode and use_compile must be booleans")
         self.model_path = str(model_path)
+        self.debug_mode = debug_mode
+        self.use_compile = use_compile
         self.cache_mode = cache_mode
         self.device = torch.device(device)
         self.dtype = dtype
@@ -63,6 +69,8 @@ class MicroInferEngine:
             block_size=self.block_size,
             num_blocks=self.num_blocks,
             engine_config=engine_config,
+            debug_mode=self.debug_mode,
+            use_compile=self.use_compile,
         )
         cache = self.llm.engine.model_runner.kv_cache
         self.meta = {
@@ -74,6 +82,8 @@ class MicroInferEngine:
             "max_model_len": self.max_model_len,
             "flash_attn_paged": self.block_size % 256 == 0,
             "cache_mode": self.cache_mode,
+            "debug_mode": self.debug_mode,
+            "use_compile": self.use_compile,
         }
         return self
 

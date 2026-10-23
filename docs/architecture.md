@@ -27,8 +27,8 @@ LLM.generate
 | BlockManager | 物理块分配、引用计数、前缀 hash 和淘汰 |
 | Scheduler | 请求准入、prefill/decode 选择、预算、抢占和完成 |
 | KVCache / LayerKVCache | 全局张量分配与单层零拷贝视图 |
-| CachedAttention | 写入本层缓存，将执行上下文适配为后端参数 |
-| paged_attention | 物理块读取、GQA 与带前缀偏移的 causal mask |
+| CachedAttention | 写入本层缓存，接收每步 `AttentionMetadata` |
+| paged_attention | 物理块读取、GQA 与带前缀偏移的 causal mask；`_meta` 快路径 + 校验入口 |
 | QwenModel | embedding、decoder layers、final norm 和 LM head |
 | ModelRunner | 准备模型输入、绑定缓存、执行与采样 |
 | LLMEngine | schedule → run → postprocess 循环 |
@@ -58,11 +58,22 @@ Runner 持有 `KVCache.keys/values: [layers, blocks, B, Hkv, D]`。
 `cache.layer(i)` 返回本层 `[blocks, B, Hkv, D]` 张量视图，绑定过程不复制存储。
 每层的 `Attention.attn: CachedAttention` 持有该视图；模型 forward 不传全局池或层号。
 
-LayerKVCache.write 支持 `-1` padding，并在写入前验证形状、范围和重复 slot。
+LayerKVCache 有两个写入入口：`write_checked` 支持 `-1` padding，并在写入前验证形状、
+范围和重复 slot；`write_fast` 接收 `AttentionMetadata.slot_indices` 预计算好的
+`blocks/offsets`，不做 host 校验。`write` 保留为 checked 别名。生产 decode 走
+`write_fast`，`debug_mode=True` 时走 `write_checked`。
 BlockManager 管引用计数，释放块不清零张量。计算只读取有效块表与 context lengths 指定的数据。
 
-Context 使用 ContextVar 保存本轮的 slot、位置、序列长度与块表。Runner 在 finally 中清理，
-数值测试 adapter 使用 use_context 恢复外层状态。Context 隔离不等于共享缓存可并发写入。
+Runner 每步构建一次 `AttentionMetadata`，包含 slot、位置、`cu_seqlens_q/k`、
+context lengths、block tables 和直接 prefill 标记；`ModelRunner.run_model` 把它显式传给
+`QwenModel` → `TransformerLayer` → `Attention` → `CachedAttention`。CPU 侧的
+`cu_q_cpu` / `context_lens_cpu` 是懒加载并缓存的：decode flash 路径不会 `.tolist()`，
+只有 prefill/参考路径在第一次访问时转换一次。
+
+Context 使用 ContextVar 保存同一份 metadata 以及 slot、位置、序列长度与块表，
+用于测试、`forward_batch` 和直接调用兼容；Runner 在 finally 中清理。
+`AttentionMetadata.from_context()` 在 metadata 缺失时从 Context 字段重建。
+Context 隔离不等于共享缓存可并发写入。
 
 先确定模型 dtype/device，再分配池；更换池时需要同步重建 BlockManager，不能保留旧前缀索引。
 缓存是运行时数据，不属于模型权重，也不写入 state_dict。
@@ -70,20 +81,37 @@ Context 使用 ContextVar 保存本轮的 slot、位置、序列长度与块表�
 ## 模型与 attention 后端
 
 Qwen3 使用 bias-free SwiGLU、逐 head Q/K RMSNorm、split-half RoPE 和 GQA。
-`rope.apply` 同时保留相邻实虚数对布局供独立算子测试，模型默认采用 Qwen3 的 split-half 布局。
-RMSNorm 在 FP32 中归一化，并返回累加后的 residual。
+`QwenModel` 创建一个 `RotaryCache`，28 层共享同一张 FP32 `cos/sin` 表；表在第一次
+forward 时按 activation device 懒构建，按 position 索引，不在每层重新计算角度或复数。
+`rope.apply` / `rotate` 仍保留为独立算子接口，供测试和非模型路径使用。
+RMSNorm 默认走 `F.rms_norm` fused kernel（内部 FP32 累加），并返回累加后的
+residual；`fused_layer_norm=False` 时保留逐 op 的 `_reference_forward` 路径，
+用于测试和 A/B。Q/K norm 复用同一个 `FuseLayerNorm`。
 
 Attention.forward 支持 dense `[batch, length, hidden]` 与 packed `[tokens, hidden]`。
-dense 路径不改动 KV 池，packed 路径通过 Context 读写本层缓存：
+dense 路径不改动 KV 池，packed 路径通过 `AttentionMetadata` 读写本层缓存：
 
+- Runner 每步构建一次 metadata；Attention/CachedAttention 不再每层读 ContextVar。
 - 无前缀 prefill 直接对本轮 K/V 做逐请求 SDPA，同时写缓存。
-- 有前缀 prefill 的 context lengths 取 `diff(cu_seqlens_k)`。
-- decode 每请求一个 query，Q offsets 为 `arange(N + 1)`。
+- 有前缀 prefill 的 context lengths 由 metadata 从 `cu_seqlens_k` 差分得到。
+- decode 的 Q offsets 由 metadata 懒生成，不再每层 `arange`。
+- `paged_attention_meta` 是生产快路径：不做 host 校验、不 `.tolist()`，直接使用
+  int32/连续 tensor；`paged_attention` 保留为独立调用和测试的严格校验入口。
 - 分页参考后端的 FP16/BF16 输入在 FP32 中计算 QK、softmax、PV，输出转回输入 dtype。
 - 满足设备、dtype、head dimension 和块大小约束时，可调用 FlashAttention 分页后端。
 
-`compute_logits` 在 prefill 选择每请求最后一个 query，在 decode 保留所有行。
-`forward_batch(batch)` 为数值验证 adapter，返回全部 query 的 logits；调用前由 Runner 绑定测试池。
+`compute_logits` 在 prefill 选择每请求最后一个 query，在 decode 保留所有行；
+metadata 显式传入，缺失时才回退 Context。`forward_batch(batch)` 为数值验证 adapter，
+返回全部 query 的 logits；调用前由 Runner 绑定测试池。
+
+### 执行与可选编译
+
+Runner 默认 eager 执行。`use_compile=True` 时只编译 decode 的 `model.forward`，
+prefill 继续 eager：prefill 有可变长度逐请求循环，compile 收益低且容易 graph break；
+decode 形状更稳定，compile 能把 elementwise/norm 等小 kernel 融合。编译前 Runner 会
+调用 `RotaryCache.ensure()` 建好 cos/sin 表，避免 Dynamo 追踪 40k 行表构造。
+`AttentionMetadata`、fast KV 写入和显式 metadata 是这一阶段能 compile 的前提。
+FlashAttention 的 pybind op 仍是 opaque custom kernel 边界，compile 会在它周围分段。
 
 ## 权重与验证
 

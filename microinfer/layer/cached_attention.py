@@ -6,8 +6,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from microinfer.layer.paged_attention import paged_attention
-from microinfer.utils.context import get_context
+from microinfer.layer.metadata import AttentionMetadata
+from microinfer.layer.paged_attention import paged_attention_meta
 from microinfer.worker.kv_cache import LayerKVCache
 
 
@@ -19,41 +19,35 @@ class CachedAttention(nn.Module):
     def bind_cache(self, cache: LayerKVCache):
         self.cache = cache
 
-    def forward(self, q, k, v):
+    def forward(self, q, k, v, metadata=None):
         """Q/K already normalized/rotated. Return [T,Hq,D], including decode."""
-        ctx = get_context()
+        metadata = metadata or AttentionMetadata.from_context()
         cache = self.cache
-        if ctx.is_prefill:
-            cu_q = ctx.cu_seqlens_q
-            lengths = ctx.cu_seqlens_k[1:] - ctx.cu_seqlens_k[:-1]
-            direct = ctx.block_tables is None
-            if direct and not torch.equal(lengths, cu_q[1:] - cu_q[:-1]):
-                raise ValueError("cached prefixes require block_tables")
-        else:
-            lengths = ctx.context_lens
-            cu_q = torch.arange(q.shape[0] + 1, dtype=torch.int32, device=q.device)
-            direct = False
-        if not direct and (cache is None or ctx.block_tables is None):
+        # Metadata construction + Runner debug validation own this invariant;
+        # keeping the list comparison here would graph-break torch.compile.
+        direct = metadata.direct_prefill if metadata.is_prefill else False
+        if not direct and (cache is None or metadata.block_tables is None):
             raise RuntimeError(
                 "paged attention requires a bound layer cache and block table"
             )
         if cache is not None:
-            if ctx.slot_mapping is None:
+            if metadata.slot_mapping is None:
                 raise ValueError("bound cache requires slot_mapping")
-            cache.write(ctx.slot_mapping, k, v)
+            if metadata.validate_cache_write:
+                cache.write(metadata.slot_mapping, k, v)
+            else:
+                blocks, offsets = metadata.slot_indices(cache.block_size)
+                cache.write_fast(blocks, offsets, k, v)
         if not direct:
-            return paged_attention(
-                q, cache.keys, cache.values, ctx.block_tables, lengths, cu_q
-            )
+            return paged_attention_meta(q, cache.keys, cache.values, metadata)
 
         # No-prefix prefill/warmup: current K/V suffice. SDPA also works on CPU.
         # This eager path can later be replaced by flash_attn_varlen_func.
         result = torch.empty_like(q)
-        offsets = cu_q.tolist()
         if q.shape[1] % k.shape[1]:
             raise ValueError("query heads must be divisible by KV heads")
         repeats = q.shape[1] // k.shape[1]
-        for start, end in pairwise(offsets):
+        for start, end in pairwise(metadata.cu_q_cpu):
             if start == end:
                 continue
             keys = k[start:end].repeat_interleave(repeats, dim=1).transpose(0, 1)

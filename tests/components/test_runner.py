@@ -21,12 +21,12 @@ class ToyModel(nn.Module):
         super().__init__()
         self.calls = []
 
-    def forward(self, input_ids, positions):
+    def forward(self, input_ids, positions, metadata=None):
         assert not torch.is_grad_enabled()
         self.calls.append((input_ids.clone(), positions.clone()))
         return F.one_hot((input_ids + 1) % 16, 16).float()
 
-    def compute_logits(self, hidden):
+    def compute_logits(self, hidden, metadata=None):
         context = get_context()
         return (
             hidden[context.cu_seqlens_q[1:].long() - 1]
@@ -119,7 +119,7 @@ def test_empty_work_skips_model(sequence_cls):
 @pytest.mark.extension
 def test_exception_cleanup_clears_context(sequence_cls):
     class BrokenModel(ToyModel):
-        def forward(self, ids, positions):
+        def forward(self, ids, positions, metadata=None):
             raise RuntimeError("execution failed")
 
     seq = sequence_cls([1])
@@ -127,3 +127,83 @@ def test_exception_cleanup_clears_context(sequence_cls):
     with pytest.raises(RuntimeError, match="execution failed"):
         ModelRunner(BrokenModel(), None, ArgmaxSampler(), block_size=4).run([seq], True)
     assert get_context().slot_mapping is None
+
+
+def test_debug_validation_accepts_consistent_prefill(sequence_cls):
+    seq = sequence_cls([1, 2, 3, 4])
+    seq.num_scheduled_tokens, seq.block_table = 4, [0]
+    runner = ModelRunner(None, None, None, block_size=4, debug_mode=True)
+    ids, positions = runner.prepare_prefill([seq])
+    assert ids.tolist() == [1, 2, 3, 4]
+    assert positions.tolist() == [0, 1, 2, 3]
+
+
+def test_debug_validation_accepts_consistent_decode(sequence_cls):
+    seq = sequence_cls([1, 2, 3, 4, 5])
+    seq.num_cached_tokens = 4
+    seq.num_scheduled_tokens = 1
+    seq.block_table = [0, 1]
+    runner = ModelRunner(None, None, None, block_size=4, debug_mode=True)
+    ids, positions = runner.prepare_decode([seq])
+    assert ids.tolist() == [5]
+    assert positions.tolist() == [4]
+
+
+def test_debug_validation_rejects_duplicate_slots(sequence_cls):
+    a, b = sequence_cls([1, 2]), sequence_cls([3, 4])
+    for seq in (a, b):
+        seq.num_scheduled_tokens, seq.block_table = 2, [0]
+    runner = ModelRunner(None, None, None, block_size=4, debug_mode=True)
+    with pytest.raises(ValueError, match="duplicate"):
+        runner.prepare_prefill([a, b])
+
+
+def test_debug_mode_off_skips_runner_validation(sequence_cls):
+    a, b = sequence_cls([1, 2]), sequence_cls([3, 4])
+    for seq in (a, b):
+        seq.num_scheduled_tokens, seq.block_table = 2, [0]
+    runner = ModelRunner(None, None, None, block_size=4, debug_mode=False)
+    ids, _ = runner.prepare_prefill([a, b])
+    assert ids.tolist() == [1, 2, 3, 4]
+
+
+def test_debug_validation_rejects_out_of_range_slot(sequence_cls):
+    seq = sequence_cls([1, 2, 3, 4, 5])
+    seq.num_cached_tokens = 1
+    seq.num_scheduled_tokens = 3
+    seq.block_table = [99]
+
+    class Cache:
+        num_blocks = 2
+
+    runner = ModelRunner(None, None, None, block_size=4, debug_mode=True)
+    runner.kv_cache = Cache()
+    with pytest.raises(ValueError, match="KV capacity|block"):
+        runner.prepare_prefill([seq])
+
+
+def test_runner_stores_safety_flags():
+    runner = ModelRunner(
+        ToyModel(), None, None, block_size=4, debug_mode=True, use_compile=False
+    )
+    assert runner.debug_mode is True
+    assert runner.use_compile is False
+
+
+def test_compile_is_decode_only():
+    runner = ModelRunner(ToyModel(), None, None, block_size=4, use_compile=True)
+    assert runner._forward_for(True) is runner._forward
+    assert runner._forward_for(False) is runner._compiled_forward
+
+
+def test_prepare_attaches_attention_metadata(sequence_cls):
+    seq = sequence_cls([1, 2])
+    seq.num_scheduled_tokens, seq.block_table = 2, [0]
+    runner = ModelRunner(None, None, None, block_size=4)
+    runner.prepare_prefill([seq])
+    metadata = get_context().metadata
+    assert metadata is not None
+    assert metadata.is_prefill and metadata.direct_prefill
+    assert metadata.cu_q_cpu == (0, 2)
+    assert metadata.q_lens_cpu == (2,)
+    assert metadata.slot_mapping.tolist() == [0, 1]

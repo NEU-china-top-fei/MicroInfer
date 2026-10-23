@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from microinfer.config import SampleParameter
@@ -43,6 +45,21 @@ def frontend(sequence_cls):
 
     engine = Engine()
     return LLM(engine, Input(), Output()), engine
+
+
+def test_from_model_passes_debug_mode_to_runner_and_scheduler(tiny_config):
+    from microinfer.model.qwen3 import QwenModel
+
+    model = QwenModel(tiny_config).eval()
+    llm = LLM.from_model(
+        model,
+        SimpleNamespace(eos_token_id=0),
+        block_size=4,
+        num_blocks=8,
+        debug_mode=True,
+    )
+    assert llm.engine.model_runner.debug_mode is True
+    assert llm.engine.scheduler.config.debug_mode is True
 
 
 @pytest.mark.parametrize("per_request", [False, True])

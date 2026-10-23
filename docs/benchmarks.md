@@ -205,16 +205,59 @@ P1/P3 的修复方向：
 3. 保证 q/k/v 在送入 attention 前是连续布局，避免 math 后端；
 4. 预期 `long-prefill` 的 TTFT 从 659 ms 降到 ~100 ms 量级（HF 当前 152 ms）。
 
-完整的 Chrome trace 和文本摘要写入 `results/bench/traces/`（默认被忽略，单次 trace
-约几十 MB）。
+### 可视化输出
+
+`profile_runner.py` 默认 `--export torch`，一次生成两种可直接打开的格式：
+
+| 格式 | 文件 | 打开方式 |
+| --- | --- | --- |
+| Chrome / Perfetto | `results/bench/traces/<stem>.json` | `chrome://tracing` 或 https://ui.perfetto.dev |
+| TensorBoard / PyTorch Profiler | `results/bench/traces/tensorboard/<stem>.<pid>.<ts>.pt.trace.json.gz` | `tensorboard --logdir results/bench/traces/tensorboard`，打开 PROFILER 页 |
+| Nsight Systems | `results/bench/traces/<stem>.nsys-rep` | `nsys-ui <file>` 或 `nsys stats --report cuda_gpu_kern_sum <file>` |
+
+TensorBoard 的 PyTorch Profiler 页由 `torch-tb-profiler` 提供（只装 `tensorboard`
+会看到 `profile_redirect`，没有实际解析器）：
+
+```bash
+uv pip install tensorboard torch-tb-profiler
+# 或者安装项目的 profile extra
+python -m pip install -e '.[profile]'
+
+tensorboard --logdir results/bench/traces/tensorboard
+# 浏览器打开 http://localhost:6006 -> PROFILER
+```
+
+nsys 输出：
+
+```bash
+python -m bench.profile_runner --model /path/to/Qwen3-0.6B \
+  --workload single-short --max-tokens 1 --export nsys
+
+nsys-ui results/bench/traces/single-short_bs256.nsys-rep
+# 或无 GUI 环境下看 kernel 汇总
+nsys stats --report cuda_gpu_kern_sum \
+  results/bench/traces/single-short_bs256.nsys-rep
+```
+
+`--export nsys` 会用子进程运行 workload，并传入
+`--trace=cuda,nvtx --stats=false --resolve-symbols=false`。`--stats=false` 和
+`--resolve-symbols=false` 用来避免离线环境下的符号下载卡住；NVTX range
+`microinfer.load_model`、`microinfer.warmup`、`microinfer.generate` 会把时间线分段。
+nsys 与 torch.profiler 不能在同一进程里同时使用 CUPTI，所以脚本自动切换为子进程。
+nsys 的 trace 包含模型加载和 warmup，分析时请缩放到 `microinfer.generate` 这一段。
+
+其他导出模式：`--export chrome` 只写 Chrome JSON，`--export tensorboard` 只写
+TensorBoard trace，`--export run` 只跑 workload 不做 profiling。trace 较大，建议先用
+`--max-tokens 1`（prefill）或 `--max-tokens 8`（decode）控制体积。
 
 ## 6. 复现
 
 以下命令都在仓库根目录运行（`bench/` 不是必须安装的运行时包）。
 
 ```bash
-# 安装（需要 HF tokenizer 与 transformers 基线）
+# 安装（需要 HF tokenizer 与 transformers 基线；profile 可选）
 python -m pip install -e '.[hf,test]'
+python -m pip install -e '.[hf,test,profile]'  # TensorBoard trace 可视化
 
 # 全部引擎；每个引擎在独立进程中运行
 python -m bench.run_all --model /path/to/Qwen3-0.6B --runs 3 --warmup 1
@@ -226,9 +269,17 @@ python -m bench.bench_offline --model /path/to/Qwen3-0.6B --engine microinfer \
 # 只看汇总表
 python -m bench.report --input-dir results/bench
 
-# 生成 trace
+# 记录一次优化消融（追加到 results/bench/ablation.csv）
+python -m bench.ablation --model /path/to/Qwen3-0.6B --label p1.1-metadata \
+  --runs 3 --warmup 1 --block-size 256 --num-blocks 64
+
+# 生成 Chrome + TensorBoard trace
 python -m bench.profile_runner --model /path/to/Qwen3-0.6B \
-  --workload single-short --max-tokens 8
+  --workload single-short --max-tokens 8 --export torch
+
+# 生成 Nsight Systems report
+python -m bench.profile_runner --model /path/to/Qwen3-0.6B \
+  --workload single-short --max-tokens 1 --export nsys
 ```
 
 `run_all` 会依次运行 MicroInfer（`bs256`、`bs16`）、HF、nano-vllm；nano-vllm 不可用时
@@ -236,6 +287,8 @@ python -m bench.profile_runner --model /path/to/Qwen3-0.6B \
 
 结果 JSON 结构：`meta`（环境/版本/配置）、`workload`（长度/请求数）、`runs`（每次的
 TTFT/TPOT/ITL/吞吐/显存）、`summary`（池化后的中位数与分位数）。
+
+优化阶段的 debug/compile 开关和消融工作流见 [P1 优化工作流](p1.md)。
 
 ## 7. 对比口径与注意事项
 
