@@ -93,6 +93,7 @@ def _load_model(args, workload, *, nvtx: bool):
             ),
             use_compile=args.use_compile,
             fuse_weights=args.fuse_weights,
+            use_cuda_graph=args.use_cuda_graph,
         )
 
 
@@ -322,6 +323,8 @@ def _run_nsys(args, workload) -> int:
         child_argv.append("--use-compile")
     if not args.fuse_weights:
         child_argv.append("--no-fuse-weights")
+    if args.use_cuda_graph:
+        child_argv.append("--use-cuda-graph")
 
     command = nsys_command(
         nsys_bin,
@@ -383,6 +386,9 @@ def main() -> int:
         action="store_false",
         dest="fuse_weights",
         help="keep separate QKV/gate-up weights (lower memory)",
+    )
+    parser.add_argument(
+        "--use-cuda-graph", action="store_true", help="enable CUDA Graph decode"
     )
     parser.add_argument(
         "--export",

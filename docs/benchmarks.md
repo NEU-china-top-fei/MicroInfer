@@ -273,6 +273,11 @@ python -m bench.report --input-dir results/bench
 python -m bench.ablation --model /path/to/Qwen3-0.6B --label p1.1-metadata \
   --runs 3 --warmup 1 --block-size 256 --num-blocks 64
 
+# decode CUDA Graph
+python -m bench.bench_offline --model /path/to/Qwen3-0.6B \
+  --engine microinfer --workloads single-short,batch8-short \
+  --runs 3 --warmup 1 --block-size 256 --num-blocks 64 --use-cuda-graph
+
 # 生成 Chrome + TensorBoard trace
 python -m bench.profile_runner --model /path/to/Qwen3-0.6B \
   --workload single-short --max-tokens 8 --export torch
@@ -288,7 +293,9 @@ python -m bench.profile_runner --model /path/to/Qwen3-0.6B \
 结果 JSON 结构：`meta`（环境/版本/配置）、`workload`（长度/请求数）、`runs`（每次的
 TTFT/TPOT/ITL/吞吐/显存）、`summary`（池化后的中位数与分位数）。
 
-优化阶段的 debug/compile 开关和消融工作流见 [P1 优化工作流](p1.md)。
+优化阶段的 debug/compile 开关和消融工作流见 [P1 优化工作流](p1.md)，
+decode CUDA Graph 的设计与结果见 [P2](p2.md)；compile/graph 的原理与排查见
+[torch.compile 与 CUDA Graph](compile-and-cuda-graph.md)。
 
 ## 7. 对比口径与注意事项
 

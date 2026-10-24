@@ -18,14 +18,19 @@ def test_eos_rejects_invalid_ids(value):
         EngineConfig(eos_token_id=value)
 
 
-@pytest.mark.parametrize("field", ["debug_mode", "use_compile"])
+@pytest.mark.parametrize("field", ["debug_mode", "use_compile", "use_cuda_graph"])
 @pytest.mark.parametrize("value", [0, 1, 1.0, "true", None])
 def test_bool_flags_reject_non_bool(field, value):
     with pytest.raises(ValueError, match=field):
         EngineConfig(**{field: value})
 
 
-@pytest.mark.parametrize("field", ["debug_mode", "use_compile"])
+@pytest.mark.parametrize("field", ["debug_mode", "use_compile", "use_cuda_graph"])
 def test_bool_flags_accept_bool(field):
     config = EngineConfig(**{field: True})
     assert getattr(config, field) is True
+
+
+def test_compile_and_cuda_graph_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        EngineConfig(use_compile=True, use_cuda_graph=True)

@@ -92,6 +92,9 @@ def main() -> int:
         dest="fuse_weights",
         help="keep separate QKV/gate-up weights (lower memory)",
     )
+    parser.add_argument(
+        "--use-cuda-graph", action="store_true", help="enable CUDA Graph decode"
+    )
     parser.add_argument("--csv", default="results/bench/ablation.csv")
     parser.add_argument(
         "--raw-dir",
@@ -146,6 +149,8 @@ def main() -> int:
         command.append("--use-compile")
     if not args.fuse_weights:
         command.append("--no-fuse-weights")
+    if args.use_cuda_graph:
+        command.append("--use-cuda-graph")
 
     print("command:", " ".join(command), flush=True)
     result = subprocess.run(command, cwd=PROJECT_ROOT, check=False)

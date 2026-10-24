@@ -62,6 +62,9 @@ def _meta(args, engine) -> dict:
         "fuse_weights": (
             args.fuse_weights if args.engine == "microinfer" else False
         ),
+        "use_cuda_graph": (
+            args.use_cuda_graph if args.engine == "microinfer" else False
+        ),
         "bench": {
             "runs": args.runs,
             "warmup": args.warmup,
@@ -141,6 +144,11 @@ def main() -> int:
         dest="fuse_weights",
         help="keep separate QKV/gate-up weights (lower memory; MicroInfer only)",
     )
+    parser.add_argument(
+        "--use-cuda-graph",
+        action="store_true",
+        help="capture decode buckets with CUDA Graph (MicroInfer only)",
+    )
     parser.add_argument("--output-dir", default="results/bench")
     parser.add_argument("--tag", default="")
     parser.add_argument("--list-workloads", action="store_true")
@@ -182,6 +190,7 @@ def main() -> int:
         debug_mode=args.debug_mode,
         use_compile=args.use_compile,
         fuse_weights=args.fuse_weights,
+        use_cuda_graph=args.use_cuda_graph,
     ).load()
 
     workloads = build_workloads(names, seed=args.seed)

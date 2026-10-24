@@ -121,15 +121,27 @@ FlashAttention 的 pybind op 仍是 opaque custom kernel 边界，compile 会在
 decode 的 metadata 使用 `_DecodeBuffers`：pinned CPU staging + 复用 device buffer，
 每个 step 原地填充 `input_ids/positions/slot_mapping/context_lens/block_tables`，
 再 `copy_(non_blocking=True)`。这去掉了每步 `torch.tensor(list, device="cuda")`
-的 H2D 同步，也为 P2 的静态 buffer/CUDA Graph 留好了形状稳定的容器。唯一的架构性
-同步是最后 `tokens.tolist()`。`Sampler` 的 logits 有限性校验只在
-`debug_mode=True` 时执行。
+的 H2D 同步。
+
+`use_cuda_graph=True` 时，Runner 在 KV cache 绑定后按 `[1,2,4,8,16,...]` bucket
+捕获 decode Graph：
+
+- batch 向上取整到 bucket，padding 行写入单独的 pad block，不触碰真实请求的 KV；
+- 每个 bucket 有固定的 `_DecodeBuffers` 和 logits 输出 buffer；
+- capture 使用全新的 `AttentionMetadata`，使 `slot_indices()` 的
+  `long/div/mod` kernel 进入图内，replay 时根据新 slot 重新计算；
+- `graph.replay()` 后只取真实 batch 的 logits，再 argmax/sample。
+
+CUDA Graph 只用于 decode，prefill 仍 eager；它与 `use_compile` 互斥。唯一的架构性
+同步仍是最后 `tokens.tolist()`。`Sampler` 的 logits 有限性校验只在
+`debug_mode=True` 时执行。详细设计与结果见 [P2 文档](p2.md)；两种优化的原理和排查方法见
+[torch.compile 与 CUDA Graph](compile-and-cuda-graph.md)。
 
 ## 权重与验证
 
 `load_model` 流式读取 safetensors，映射 Qwen3 参数名并支持 tied embeddings。
-通用模块也支持 nano-vllm 风格的 packed_modules_mapping / weight_loader 回调。
-`load_weights(mapping)` 是严格映射接口，先验证全部键和形状，再修改参数。
+加载完成后 `QwenModel.fuse_weights()` 可把 QKV 和 gate/up 打包成共享 storage 的
+buffer；`--no-fuse-weights` 可关闭。
 
 `tests/integration/test_hf_parity.py` 使用独立 Transformers Qwen3 的随机小 checkpoint，
 比较 dense、chunked、decode、共享前缀及完整贪心生成。

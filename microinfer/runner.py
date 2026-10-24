@@ -48,6 +48,15 @@ class _DecodeBuffers:
         self.width = width
 
 
+class _GraphBucket:
+    def __init__(self, batch, buffers, metadata, graph, logits):
+        self.batch = batch
+        self.buffers = buffers
+        self.metadata = metadata
+        self.graph = graph
+        self.logits = logits
+
+
 class ModelRunner:
     def __init__(
         self,
@@ -59,9 +68,15 @@ class ModelRunner:
         device="cpu",
         debug_mode: bool = False,
         use_compile: bool = False,
+        use_cuda_graph: bool = False,
+        max_num_seqs: int = 16,
     ):
         if type(debug_mode) is not bool or type(use_compile) is not bool:
             raise ValueError("debug_mode and use_compile must be booleans")
+        if type(use_cuda_graph) is not bool:
+            raise ValueError("use_cuda_graph must be a boolean")
+        if use_compile and use_cuda_graph:
+            raise ValueError("use_compile and use_cuda_graph are mutually exclusive")
         self.model = model
         self.kv_cache = None
         self.sampler = sampler
@@ -69,9 +84,14 @@ class ModelRunner:
         self.device = device
         self.debug_mode = debug_mode
         self.use_compile = use_compile
+        self.use_cuda_graph = use_cuda_graph
+        self.max_num_seqs = max_num_seqs
         self._forward = None if self.model is None else self.model.forward
         self._compiled_forward = None
         self._decode_buffers = None
+        self._pad_block_id = None
+        self._graph_buckets: list[_GraphBucket] = []
+        self._graph_pool = None
         if self.use_compile and self.model is not None:
             # Build setup-only state (the 40k-row RoPE table) before Dynamo sees
             # it; tracing table construction is expensive and shape-specialized.
@@ -106,14 +126,21 @@ class ModelRunner:
         for layer, view in zip(layers, views):
             layer.attention.bind_cache(view)
         self.kv_cache = cache
+        # A graph holds pointers into the old pool.
+        self._graph_buckets = []
+        self._graph_pool = None
 
     def allocate_kv_cache(self, num_blocks: int):
         """Allocate the runtime pool using the model's final dtype/device."""
         config = self.model.config
         weight = self.model.embedding.weight
+        # One extra block is never handed to the scheduler; padded graph rows
+        # write their KV there instead of corrupting a live request.
+        extra = 1 if self.use_cuda_graph else 0
+        self._pad_block_id = num_blocks if self.use_cuda_graph else None
         cache = KVCache(
             config.num_hidden_layer,
-            num_blocks,
+            num_blocks + extra,
             self.block_size,
             config.num_kv_head,
             config.head_dim,
@@ -121,7 +148,114 @@ class ModelRunner:
             device=weight.device,
         )
         self.bind_kv_cache(cache)
+        if self.use_cuda_graph:
+            self.capture_cuda_graphs()
         return cache
+
+    def _decode_forward(self, input_ids, positions, metadata):
+        hidden = self._forward(input_ids, positions, metadata)
+        return self.model.compute_logits(hidden, metadata)
+
+    @staticmethod
+    def _copy_decode_buffers(buffers: "_DecodeBuffers", batch: int):
+        non_blocking = buffers.pin_memory
+        for name, _ in _DECODE_SCALARS:
+            buffers.device_tensors[name][:batch].copy_(
+                buffers.cpu[name][:batch], non_blocking=non_blocking
+            )
+        buffers.device_tensors["block_tables"][:batch].copy_(
+            buffers.cpu["block_tables"][:batch], non_blocking=non_blocking
+        )
+
+    def _make_decode_metadata(self, buffers: "_DecodeBuffers", batch: int):
+        return AttentionMetadata.build(
+            is_prefill=False,
+            slot_mapping=buffers.device_tensors["slot_mapping"][:batch],
+            context_lens=buffers.device_tensors["context_lens"][:batch],
+            block_tables=buffers.device_tensors["block_tables"][:batch],
+            validate_cache_write=False,
+        )
+
+    def _fill_pad_buffers(self, buffers: "_DecodeBuffers", batch: int):
+        assert self._pad_block_id is not None
+        cpu = buffers.cpu
+        block_tables = cpu["block_tables"]
+        block_tables.fill_(-1)
+        for i in range(batch):
+            cpu["input_ids"][i] = 0
+            cpu["positions"][i] = 0
+            cpu["context_lens"][i] = 1
+            cpu["slot_mapping"][i] = (
+                self._pad_block_id * self.block_size + i % self.block_size
+            )
+            block_tables[i, 0] = self._pad_block_id
+        self._copy_decode_buffers(buffers, batch)
+
+    def _capture_bucket(self, batch: int):
+        device = torch.device(self.device)
+        buffers = _DecodeBuffers(device, pin_memory=device.type == "cuda")
+        buffers.ensure(batch, self.kv_cache.num_blocks)
+        self._fill_pad_buffers(buffers, batch)
+        input_ids = buffers.device_tensors["input_ids"][:batch]
+        positions = buffers.device_tensors["positions"][:batch]
+
+        warm_metadata = self._make_decode_metadata(buffers, batch)
+        torch.cuda.synchronize(device)  # cpu wait for gpu to complete
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream), torch.inference_mode():
+            for _ in range(2):
+                self._decode_forward(input_ids, positions, warm_metadata)
+        torch.cuda.current_stream(device).wait_stream(stream)
+        torch.cuda.synchronize(device)
+
+        # Fresh metadata: slot_indices() must run inside capture so replay
+        # recomputes block/offset tensors from the updated slot buffer.
+        capture_metadata = self._make_decode_metadata(buffers, batch)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, self._graph_pool), torch.inference_mode():
+            logits = self._decode_forward(input_ids, positions, capture_metadata)
+        if self._graph_pool is None:
+            self._graph_pool = graph.pool()
+        torch.cuda.synchronize(device)
+        self._graph_buckets.append(
+            _GraphBucket(batch, buffers, capture_metadata, graph, logits)
+        )
+
+    def capture_cuda_graphs(self):
+        if self.kv_cache is None:
+            raise RuntimeError("allocate the KV cache before capturing graphs")
+        if torch.device(self.device).type != "cuda":
+            raise RuntimeError("CUDA Graph requires a CUDA device")
+        from microinfer.layer.paged_attention import flash_attn_with_kvcache
+
+        head_dim = self.model.config.head_dim
+        weight = self.model.embedding.weight
+        if (
+            self.block_size % 256
+            or flash_attn_with_kvcache is None
+            or weight.dtype not in (torch.float16, torch.bfloat16)
+            or head_dim > 256
+            or head_dim % 8
+        ):
+            raise RuntimeError(
+                "CUDA Graph decode requires FlashAttention, CUDA FP16/BF16, "
+                "block_size multiple of 256, and head_dim <= 256 divisible by 8"
+            )
+        rotary = getattr(self.model, "rotary", None)
+        if rotary is not None:
+            rotary.ensure(torch.device(self.device))
+        buckets = [1, 2, 4, 8]
+        buckets += list(range(16, self.max_num_seqs + 1, 16))
+        buckets = sorted({b for b in buckets if b <= self.max_num_seqs})
+        if not buckets:
+            buckets = [1]
+        if buckets[-1] != self.max_num_seqs:
+            buckets.append(self.max_num_seqs)
+        self._graph_buckets = []
+        self._graph_pool = None
+        for batch in buckets:
+            self._capture_bucket(batch)
 
     def prepare_block_tables(self, seqs):
         width = max((len(seq.block_table) for seq in seqs), default=0)
@@ -323,12 +457,17 @@ class ModelRunner:
                 raise ValueError("max_seqlen_q does not match cu_seqlens_q")
             if metadata.max_seqlen_k != max(k_lens):
                 raise ValueError("max_seqlen_k does not match cu_seqlens_k")
-            if any(seq.num_cached_tokens for seq in seqs) and metadata.block_tables is None:
+            if (
+                any(seq.num_cached_tokens for seq in seqs)
+                and metadata.block_tables is None
+            ):
                 raise ValueError("cached prefixes require block_tables")
         else:
             if len(seqs) != input_ids.numel():
                 raise ValueError("decode needs exactly one token per request")
-            if metadata.context_lens is None or metadata.context_lens.numel() != len(seqs):
+            if metadata.context_lens is None or metadata.context_lens.numel() != len(
+                seqs
+            ):
                 raise ValueError("decode requires one context length per request")
             if metadata.block_tables is None:
                 raise ValueError("decode requires block_tables")
@@ -349,9 +488,8 @@ class ModelRunner:
                     raise ValueError("decode slot does not match block table")
 
         if metadata.block_tables is not None:
-            if (
-                metadata.block_tables.ndim != 2
-                or metadata.block_tables.shape[0] != len(seqs)
+            if metadata.block_tables.ndim != 2 or metadata.block_tables.shape[0] != len(
+                seqs
             ):
                 raise ValueError("block_tables must be [num_requests, max_blocks]")
             table = metadata.block_tables.tolist()
@@ -385,15 +523,80 @@ class ModelRunner:
         hidden = self._forward_for(is_prefill)(input_ids, positions, metadata)
         return self.model.compute_logits(hidden, metadata)
 
+    def _select_graph_bucket(self, batch: int):
+        for bucket in self._graph_buckets:
+            if bucket.batch >= batch:
+                return bucket
+        return None
+
+    def _fill_graph_bucket(self, bucket: _GraphBucket, seqs):
+        batch = len(seqs)
+        capacity = bucket.batch
+        assert self._pad_block_id is not None
+        cpu = bucket.buffers.cpu
+        block_tables = cpu["block_tables"]
+        block_tables.fill_(-1)
+
+        for i, seq in enumerate(seqs):
+            position = len(seq) - 1
+            cpu["input_ids"][i] = seq.last_token
+            cpu["positions"][i] = position
+            cpu["context_lens"][i] = len(seq)
+            cpu["slot_mapping"][i] = (
+                seq.block_table[position // self.block_size] * self.block_size
+                + position % self.block_size
+            )
+            block_tables[i, : len(seq.block_table)] = torch.tensor(
+                seq.block_table, dtype=torch.int32
+            )
+
+        for i in range(batch, capacity):
+            cpu["input_ids"][i] = 0
+            cpu["positions"][i] = 0
+            cpu["context_lens"][i] = 1
+            cpu["slot_mapping"][i] = (
+                self._pad_block_id * self.block_size + i % self.block_size
+            )
+            block_tables[i, 0] = self._pad_block_id
+
+        self._copy_decode_buffers(bucket.buffers, capacity)
+
+    def _run_decode(self, seqs):
+        if self.use_cuda_graph:
+            bucket = self._select_graph_bucket(len(seqs))
+            if bucket is not None:
+                self._fill_graph_bucket(bucket, seqs)
+                if self.debug_mode:
+                    tensors = bucket.buffers.device_tensors
+                    batch = len(seqs)
+                    self.validate_step(
+                        seqs,
+                        tensors["input_ids"][:batch],
+                        tensors["positions"][:batch],
+                        AttentionMetadata.build(
+                            is_prefill=False,
+                            slot_mapping=tensors["slot_mapping"][:batch],
+                            context_lens=tensors["context_lens"][:batch],
+                            block_tables=tensors["block_tables"][:batch],
+                            validate_cache_write=False,
+                        ),
+                        False,
+                    )
+                bucket.graph.replay()
+                return bucket.logits[: len(seqs)]
+        ids, positions, metadata = self.prepare_decode(seqs)
+        return self.run_model(ids, positions, False, metadata)
+
     @torch.inference_mode()
     def run(self, seqs, is_prefill):
         if not seqs:
             return []
         self.model.eval()
-        ids, positions, metadata = (
-            self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        )
-        logits = self.run_model(ids, positions, is_prefill, metadata)
+        if is_prefill:
+            ids, positions, metadata = self.prepare_prefill(seqs)
+            logits = self.run_model(ids, positions, True, metadata)
+        else:
+            logits = self._run_decode(seqs)
         greedy_flags = [s.greedy for s in seqs]
         if all(greedy_flags):
             tokens = logits.argmax(-1)
@@ -401,8 +604,6 @@ class ModelRunner:
             tokens = self.sampler(logits, self.prepare_sample(seqs))
         else:
             tokens = self.sampler(logits, self.prepare_sample(seqs))
-            greedy = torch.tensor(
-                greedy_flags, device=logits.device, dtype=torch.bool
-            )
+            greedy = torch.tensor(greedy_flags, device=logits.device, dtype=torch.bool)
             tokens = torch.where(greedy, logits.argmax(-1), tokens)
         return tokens.tolist()

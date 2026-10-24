@@ -30,6 +30,7 @@ class LLM:
         debug_mode=None,
         use_compile=None,
         fuse_weights=True,
+        use_cuda_graph=None,
     ):
         from microinfer.engine.blockmanager import BlockManager
         from microinfer.engine.llm_engine import LLMEngine
@@ -46,6 +47,8 @@ class LLM:
             overrides["debug_mode"] = debug_mode
         if use_compile is not None:
             overrides["use_compile"] = use_compile
+        if use_cuda_graph is not None:
+            overrides["use_cuda_graph"] = use_cuda_graph
         if overrides:
             config = replace(config, **overrides)
         if config.max_model_len > model.config.max_pos_embed:
@@ -62,6 +65,8 @@ class LLM:
             device=model.embedding.weight.device,
             debug_mode=config.debug_mode,
             use_compile=config.use_compile,
+            use_cuda_graph=config.use_cuda_graph,
+            max_num_seqs=config.max_num_seqs,
         )
         runner.allocate_kv_cache(num_blocks)
         scheduler = Scheduler(config, BlockManager(num_blocks, block_size))
@@ -88,6 +93,7 @@ class LLM:
         debug_mode=None,
         use_compile=None,
         fuse_weights=True,
+        use_cuda_graph=None,
     ):
         """Load a local Qwen3 directory. Never downloads or executes remote code."""
         import torch
@@ -127,6 +133,7 @@ class LLM:
             debug_mode=debug_mode,
             use_compile=use_compile,
             fuse_weights=fuse_weights,
+            use_cuda_graph=use_cuda_graph,
         )
 
     def generate(self, prompts, sampling_params=None, use_tqdm=True):

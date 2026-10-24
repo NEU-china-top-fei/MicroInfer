@@ -29,6 +29,11 @@ def main():
         help="keep separate QKV/gate-up weights (lower memory, more GEMMs)",
     )
     parser.add_argument(
+        "--use-cuda-graph",
+        action="store_true",
+        help="capture decode buckets with CUDA Graph",
+    )
+    parser.add_argument(
         "--model", required=True, help="local safetensors/tokenizer directory"
     )
     parser.add_argument(
@@ -51,6 +56,7 @@ def main():
         debug_mode=args.debug_mode,
         use_compile=args.use_compile,
         fuse_weights=args.fuse_weights,
+        use_cuda_graph=args.use_cuda_graph,
     )
     results = llm.generate(
         args.prompt,

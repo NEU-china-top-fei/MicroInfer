@@ -48,6 +48,9 @@ def main() -> int:
         dest="fuse_weights",
         help="keep separate QKV/gate-up weights (lower memory)",
     )
+    parser.add_argument(
+        "--use-cuda-graph", action="store_true", help="enable CUDA Graph decode"
+    )
     parser.add_argument("--output-dir", default="results/bench")
     parser.add_argument("--skip-bs16", action="store_true")
     parser.add_argument(
@@ -116,6 +119,8 @@ def main() -> int:
                 command.append("--use-compile")
             if not args.fuse_weights:
                 command.append("--no-fuse-weights")
+            if args.use_cuda_graph:
+                command.append("--use-cuda-graph")
             commands.append((f"microinfer {tag}", command))
     if "hf" in engines:
         commands.append(("hf", common + ["--engine", "hf"]))

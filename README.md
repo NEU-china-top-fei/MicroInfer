@@ -13,9 +13,10 @@ Qwen3 推理引擎，支持 CPU 与单卡 CUDA，适合学习和实验推理引�
 - 本地 safetensors 权重加载，支持 tied embeddings
 - CPU 参考实现与可选的 FlashAttention 后端
 - 可复现离线 benchmark（TTFT、TPOT、吞吐、显存），含 HF 与 nano-vllm 基线
+- 可选 decode CUDA Graph / decode-only `torch.compile`
 
-默认采用 eager 执行。暂不支持 Tensor Parallel、CUDA Graph、量化模型、滑动窗口注意力和
-scaled RoPE；本项目不以生产服务或吞吐性能为目标。
+默认采用 eager 执行；性能实验可开启 decode-only compile 或 CUDA Graph。
+暂不支持 Tensor Parallel、量化模型、滑动窗口注意力和 scaled RoPE。
 
 ## 安装
 
@@ -131,13 +132,20 @@ python -m bench.run_all --model /path/to/Qwen3-0.6B --runs 3 --warmup 1
 python -m bench.report --input-dir results/bench
 ```
 
-当前 RTX 4060 Laptop / Qwen3-0.6B 的冷启动结果（output tok/s）：
+当前 RTX 4060 Laptop / Qwen3-0.6B、block_size=256、cold cache 的结果
+（output tok/s）：
 
-| workload | MicroInfer bs256 | HF Transformers | nano-vllm |
-| --- | ---: | ---: | ---: |
-| single-short | 37.5 | 75.1 | 153.0 |
-| batch8-short | 257.9 | 531.3 | 964.5 |
-| long-prefill | 21.7 | 56.9 | 93.0 |
+| workload | eager | decode compile | decode CUDA Graph | HF | nano-vllm |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| single-short | 69.5 | 89.2 | **110.4** | 75.1 | 153.0 |
+| batch8-short | 497.5 | 576.0 | **678.1** | 531.3 | 964.5 |
+| long-prefill | 52.5 | 56.5 | **64.4** | 56.9 | 93.0 |
+
+- compile 和 graph 是互斥模式；graph 在低/中 batch 收益最大，batch32 上 compile
+  略快（GPU 已接近计算受限）。
+- 完整消融和 profiling 见 [P1 优化记录](docs/p1.md) 与
+  [P2 CUDA Graph](docs/p2.md)；
+两者的原理、取舍和排查方法见 [torch.compile 与 CUDA Graph](docs/compile-and-cuda-graph.md)。
 
 默认使用 cold cache；`--cache-mode warm` 用于观察重复 workload 的前缀缓存稳态收益。
 profiling 默认输出 Chrome/Perfetto JSON + TensorBoard trace，`--export nsys` 输出
@@ -151,8 +159,8 @@ python -m bench.profile_runner --model /path/to/Qwen3-0.6B \
 ```
 
 完整结果、profiling 热点和可视化方式见 [docs/benchmarks.md](docs/benchmarks.md)；
-P1 的 `debug_mode` / `use_compile` 开关和消融记录见 [docs/p1.md](docs/p1.md)。
-这是后续优化的起点，不是最终性能。
+P1 的 `debug_mode` / `use_compile` 开关和消融记录见 [docs/p1.md](docs/p1.md)，
+decode CUDA Graph 的设计与结果见 [docs/p2.md](docs/p2.md)。
 
 ## 参考项目
 
