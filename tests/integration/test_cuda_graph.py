@@ -72,6 +72,77 @@ def test_graph_decode_matches_eager_with_padded_bucket():
     assert len(graph_tokens) == 3
 
 
+def test_graph_decode_with_triton_small_blocks():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device is not available")
+    pytest.importorskip("triton")
+    torch.manual_seed(0)
+    config = _config()
+    graph_model = QwenModel(config).to("cuda", dtype=torch.bfloat16).eval()
+    eager_model = QwenModel(config).to("cuda", dtype=torch.bfloat16).eval()
+    eager_model.load_state_dict(graph_model.state_dict())
+
+    graph_runner = ModelRunner(
+        graph_model,
+        None,
+        Sampler(),
+        block_size=16,
+        device="cuda",
+        use_cuda_graph=True,
+        max_num_seqs=4,
+    )
+    graph_runner.allocate_kv_cache(2)
+    eager_runner = ModelRunner(
+        eager_model, None, Sampler(), block_size=16, device="cuda"
+    )
+    eager_runner.allocate_kv_cache(2)
+
+    assert [bucket.batch for bucket in graph_runner._graph_buckets] == [1, 2, 4]
+    graph_seqs = [_decode_seq(tokens) for tokens in ([1], [2, 3], [4, 5, 6])]
+    eager_seqs = [_decode_seq(tokens) for tokens in ([1], [2, 3], [4, 5, 6])]
+
+    with torch.inference_mode():
+        graph_tokens = graph_runner.run(graph_seqs, False)
+        eager_tokens = eager_runner.run(eager_seqs, False)
+
+    assert graph_tokens == eager_tokens
+    assert len(graph_tokens) == 3
+
+
+def test_compile_decode_with_triton_small_blocks():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device is not available")
+    pytest.importorskip("triton")
+    torch.manual_seed(0)
+    config = _config()
+    compiled_model = QwenModel(config).to("cuda", dtype=torch.bfloat16).eval()
+    eager_model = QwenModel(config).to("cuda", dtype=torch.bfloat16).eval()
+    eager_model.load_state_dict(compiled_model.state_dict())
+
+    compiled_runner = ModelRunner(
+        compiled_model,
+        None,
+        Sampler(),
+        block_size=16,
+        device="cuda",
+        use_compile=True,
+    )
+    compiled_runner.allocate_kv_cache(2)
+    eager_runner = ModelRunner(
+        eager_model, None, Sampler(), block_size=16, device="cuda"
+    )
+    eager_runner.allocate_kv_cache(2)
+
+    compiled_seqs = [_decode_seq(tokens) for tokens in ([1], [2, 3], [4, 5, 6])]
+    eager_seqs = [_decode_seq(tokens) for tokens in ([1], [2, 3], [4, 5, 6])]
+
+    with torch.inference_mode():
+        compiled_tokens = compiled_runner.run(compiled_seqs, False)
+        eager_tokens = eager_runner.run(eager_seqs, False)
+
+    assert compiled_tokens == eager_tokens
+
+
 def test_graph_and_compile_are_mutually_exclusive():
     with pytest.raises(ValueError, match="mutually exclusive"):
         ModelRunner(

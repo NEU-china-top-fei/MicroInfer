@@ -238,6 +238,11 @@ python -m bench.profile_runner ... --use-compile --export torch
 本项目的 FlashAttention break 被接受为“opaque custom kernel”边界；
 compile 仍然能融合 attention 之外的 norm/FFN/elementwise。
 
+P3 的 Triton paged decode 是一个例外：它是普通 Python 函数 + Triton launch，
+Dynamo 能完整追踪。`block_size=16` 时 decode 编译成单图（0 graph break），
+而 `block_size=256` 的 FlashAttention 路径有 7 次 break。这也是小 block compile
+在低/中 batch 上能超过 CUDA Graph 的原因，详见 [P3 文档](p3.md)。
+
 ---
 
 ## 2. CUDA Graph
@@ -397,17 +402,18 @@ with torch.cuda.graph(graph, self._graph_pool):
 
 ### 2.7 前置条件
 
-Graph 捕获要求 decode 走 FlashAttention 快路径：
+Graph 捕获要求 decode 走 FlashAttention 或 Triton paged kernel：
 
 - CUDA；
 - FP16/BF16；
-- `block_size % 256 == 0`（默认 CLI 的 16 不满足）；
-- `head_dim <= 256` 且 `head_dim % 8 == 0`；
-- FlashAttention 可用。
+- FlashAttention 可用且 `block_size % 256 == 0`，或 Triton 可用且
+  `block_size`、`head_dim` 为 2 的幂；
+- `head_dim <= 256` 且 `head_dim % 8 == 0`。
 
 不满足时 `capture_cuda_graphs()` 会给出明确错误，而不是静默退回 eager。
 
 原因：reference decode 路径里有 `.tolist()`/host 同步，无法被 graph 捕获。
+小 block 的 Triton kernel 与 graph 的配合见 [P3 文档](p3.md)。
 
 ### 2.8 性能数字
 
@@ -495,6 +501,7 @@ use_compile=True  XOR  use_cuda_graph=True
 | 场景 | 建议 |
 | --- | --- |
 | 低/中 batch decode，CPU launch 是瓶颈 | CUDA Graph |
+| 低/中 batch + 小 block Triton decode | compile（单图 + 融合） |
 | 无法固定 shape，或需要动态长度 | torch.compile / eager |
 | prefill 长度变化大 | eager（或专门 varlen kernel） |
 | batch 很大、GPU 已计算受限 | 先做 kernel 融合/打包；compile 可能比 graph 更值 |
@@ -503,7 +510,8 @@ use_compile=True  XOR  use_cuda_graph=True
 
 本项目当前推荐：
 
-- 交互/低并发：`--use-cuda-graph`；
+- 交互/低并发 + `block_size=16`：`--use-compile`（P3 的 Triton kernel 可完整追踪）；
+- 交互/低并发 + `block_size=256`：`--use-cuda-graph`；
 - 批处理/GPU 受限：`--use-compile`；
 - 正确性/调试：默认 eager + `--debug-mode`。
 

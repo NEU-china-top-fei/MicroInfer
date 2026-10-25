@@ -79,6 +79,21 @@ class MicroInferEngine:
             use_cuda_graph=self.use_cuda_graph,
         )
         cache = self.llm.engine.model_runner.kv_cache
+        from microinfer.layer.paged_attention import (
+            flash_attn_varlen_func,
+            flash_attn_with_kvcache,
+        )
+        from microinfer.layer.triton_paged_attention import HAS_TRITON
+
+        head_dim = self.llm.engine.model_runner.model.config.head_dim
+        flash_paged = (
+            flash_attn_with_kvcache is not None and self.block_size % 256 == 0
+        )
+        triton_paged = (
+            HAS_TRITON
+            and self.block_size & (self.block_size - 1) == 0
+            and head_dim & (head_dim - 1) == 0
+        )
         self.meta = {
             "block_size": self.block_size,
             "num_blocks": self.num_blocks,
@@ -86,7 +101,16 @@ class MicroInferEngine:
             "max_num_seqs": self.max_num_seqs,
             "max_num_batched_tokens": self.max_num_batched_tokens,
             "max_model_len": self.max_model_len,
-            "flash_attn_paged": self.block_size % 256 == 0,
+            "flash_attn_paged": flash_paged,
+            "triton_paged_decode": triton_paged and not flash_paged,
+            "decode_backend": (
+                "flash" if flash_paged else ("triton" if triton_paged else "reference")
+            ),
+            "prefill_backend": (
+                "flash-paged"
+                if flash_paged
+                else ("gather-varlen" if flash_attn_varlen_func else "reference")
+            ),
             "cache_mode": self.cache_mode,
             "debug_mode": self.debug_mode,
             "use_compile": self.use_compile,

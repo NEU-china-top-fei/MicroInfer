@@ -14,6 +14,8 @@ Qwen3 推理引擎，支持 CPU 与单卡 CUDA，适合学习和实验推理引�
 - CPU 参考实现与可选的 FlashAttention 后端
 - 可复现离线 benchmark（TTFT、TPOT、吞吐、显存），含 HF 与 nano-vllm 基线
 - 可选 decode CUDA Graph / decode-only `torch.compile`
+- 任意 2 的幂 block size：大 block 走 FlashAttention 分页 kernel，小 block 走
+  Triton paged decode + gather/varlen prefill
 
 默认采用 eager 执行；性能实验可开启 decode-only compile 或 CUDA Graph。
 暂不支持 Tensor Parallel、量化模型、滑动窗口注意力和 scaled RoPE。
@@ -141,11 +143,25 @@ python -m bench.report --input-dir results/bench
 | batch8-short | 497.5 | 576.0 | **678.1** | 531.3 | 964.5 |
 | long-prefill | 52.5 | 56.5 | **64.4** | 56.9 | 93.0 |
 
-- compile 和 graph 是互斥模式；graph 在低/中 batch 收益最大，batch32 上 compile
-  略快（GPU 已接近计算受限）。
-- 完整消融和 profiling 见 [P1 优化记录](docs/p1.md) 与
-  [P2 CUDA Graph](docs/p2.md)；
-两者的原理、取舍和排查方法见 [torch.compile 与 CUDA Graph](docs/compile-and-cuda-graph.md)。
+`block_size=16` 不再需要为了性能退回 256；小 block 路径使用 Triton paged decode +
+gather/varlen prefill（`num_blocks=1024`，KV 容量相同）：
+
+| workload | bs16 eager | bs16 compile | bs16 graph | bs256 graph |
+| --- | ---: | ---: | ---: | ---: |
+| single-short | 63.4 | **126.9** | 112.5 | 110.3 |
+| batch8-short | 469.4 | **710.7** | 676.9 | 679.1 |
+| batch32-mixed | 847.8 | 847.0 | 914.3 | **918.0** |
+| shared-prefix | 482.1 | 619.1 | **699.3** | 690.2 |
+| long-prefill | 50.0 | 59.7 | **65.0** | 64.1 |
+
+- compile 和 graph 是互斥模式；block16 的 Triton kernel 可被 Dynamo 完整追踪，
+  decode 编译成单图，因此单流/batch8 上 compile 更快；高 batch/长上下文 graph
+  与 `block_size=256` + FlashAttention 持平。
+- 4K context decode 的 TPOT：block16 12.6 ms vs block256 12.1 ms。
+- 完整消融和 profiling 见 [P1 优化记录](docs/p1.md)、
+  [P2 CUDA Graph](docs/p2.md) 与 [P3 Attention 快路径](docs/p3.md)；
+  两种执行优化的原理、取舍和排查方法见
+  [torch.compile 与 CUDA Graph](docs/compile-and-cuda-graph.md)。
 
 默认使用 cold cache；`--cache-mode warm` 用于观察重复 workload 的前缀缓存稳态收益。
 profiling 默认输出 Chrome/Perfetto JSON + TensorBoard trace，`--export nsys` 输出
@@ -160,7 +176,8 @@ python -m bench.profile_runner --model /path/to/Qwen3-0.6B \
 
 完整结果、profiling 热点和可视化方式见 [docs/benchmarks.md](docs/benchmarks.md)；
 P1 的 `debug_mode` / `use_compile` 开关和消融记录见 [docs/p1.md](docs/p1.md)，
-decode CUDA Graph 的设计与结果见 [docs/p2.md](docs/p2.md)。
+decode CUDA Graph 的设计与结果见 [docs/p2.md](docs/p2.md)，小 block 的 Triton
+decode 与 gather/varlen prefill 见 [docs/p3.md](docs/p3.md)。
 
 ## 参考项目
 

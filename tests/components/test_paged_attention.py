@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from microinfer.layer.paged_attention import _paged_attention_reference
 from tests.support.attention import checked_paged_attention as paged_attention
 
 pytestmark = pytest.mark.component
@@ -100,3 +101,62 @@ def test_reference_accumulates_large_scores_without_half_precision_overflow(
     )
     assert actual.dtype == dtype
     torch.testing.assert_close(actual, torch.full_like(query, 3.0))
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_small_block_paged_prefill_matches_reference(dtype):
+    """Gather+varlen prefill must keep prefix reuse and physical block order."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA device is not available")
+    if torch.cuda.get_device_capability() < (8, 0):
+        pytest.skip("FlashAttention requires Ampere or newer")
+
+    block_size, num_blocks = 16, 6
+    num_q_heads, num_kv_heads, head_dim = 8, 2, 32
+    contexts = [33, 17]
+    q_lens = [16, 5]
+    cu_q = torch.tensor([0, 16, 21], dtype=torch.int32, device="cuda")
+    block_tables = torch.tensor(
+        [[5, 1, 3], [0, 4, 2]], dtype=torch.int32, device="cuda"
+    )
+    keys = torch.full(
+        (num_blocks, block_size, num_kv_heads, head_dim),
+        1000.0,
+        dtype=dtype,
+        device="cuda",
+    )
+    values = torch.full_like(keys, -1000.0)
+    logical_k = torch.randn(
+        sum(contexts), num_kv_heads, head_dim, dtype=dtype, device="cuda"
+    )
+    logical_v = torch.randn_like(logical_k)
+    position = 0
+    for request, context_len in enumerate(contexts):
+        for token in range(context_len):
+            block = block_tables[request, token // block_size]
+            keys[block, token % block_size] = logical_k[position + token]
+            values[block, token % block_size] = logical_v[position + token]
+        position += context_len
+
+    query = torch.randn(sum(q_lens), num_q_heads, head_dim, dtype=dtype, device="cuda")
+    scale = 1.0 / head_dim**0.5
+    expected = _paged_attention_reference(
+        query,
+        keys,
+        values,
+        block_tables,
+        contexts,
+        cu_q.tolist(),
+        scale=scale,
+    )
+    actual = paged_attention(
+        query,
+        keys,
+        values,
+        block_tables,
+        torch.tensor(contexts, dtype=torch.int32, device="cuda"),
+        cu_q,
+        scale=scale,
+    )
+    torch.testing.assert_close(actual.float(), expected.float(), atol=2e-2, rtol=2e-2)

@@ -99,10 +99,13 @@ MicroInfer bs256 的缓存/容量指标：
    `batch32-mixed` 的 TTFT 为 922 ms，nano 是 366 ms。profiling 显示 no-prefix prefill
    落到了 SDPA 的 math 后端：`bmm`、`add_`、`softmax`、`where`、`isneginf` 合计占
    大部分 GPU 时间（见第 5 节）。这是 P1/P3 的首要目标（varlen FlashAttention）。
-3. **`block_size=16` 会静默关闭 FlashAttention 分页路径。**
-   当前实现要求 `block_size % 256 == 0`；默认 16 时回退到逐请求 Python 参考实现：
+3. **`block_size=16` 曾经会静默关闭 FlashAttention 分页路径。**
+   P0 时实现要求 `block_size % 256 == 0`；默认 16 时回退到逐请求 Python 参考实现：
    单流 33.4 vs 37.5 tok/s、batch-8 122.0 vs 257.9、batch32 155.0 vs 506.1。
-   P1/P3 会去掉这个隐式约束。
+   P3 已用 Triton paged decode + gather/varlen prefill 去掉这个隐式约束：
+   block16 graph 达到单流 112.5、batch8 676.9、batch32 914.3 tok/s，
+   block16 compile 单流 126.9、batch8 710.7。设计、数值验证和与 FA 的
+   对照见 [P3 文档](p3.md)。
 4. **前缀缓存有效，且测到了真实的跨请求复用。**
    `shared-prefix` bs256 命中 12,288 tokens（8 × 512），命中率 94.1%；
    TTFT 39.6 ms，低于 `batch8-short` 的 95.8 ms；吞吐 278.1 tok/s 与 HF 基本持平
@@ -294,7 +297,8 @@ python -m bench.profile_runner --model /path/to/Qwen3-0.6B \
 TTFT/TPOT/ITL/吞吐/显存）、`summary`（池化后的中位数与分位数）。
 
 优化阶段的 debug/compile 开关和消融工作流见 [P1 优化工作流](p1.md)，
-decode CUDA Graph 的设计与结果见 [P2](p2.md)；compile/graph 的原理与排查见
+decode CUDA Graph 的设计与结果见 [P2](p2.md)，小 block 的 Triton decode 与
+gather/varlen prefill 见 [P3](p3.md)；compile/graph 的原理与排查见
 [torch.compile 与 CUDA Graph](compile-and-cuda-graph.md)。
 
 ## 7. 对比口径与注意事项
@@ -306,7 +310,8 @@ decode CUDA Graph 的设计与结果见 [P2](p2.md)；compile/graph 的原理与
   参考实现不支持 greedy，使用 `temperature=0.6` 采样；`gpu_memory_utilization=0.9`。
   吞吐接近，但采样策略和显存配置不同。
 - **MicroInfer 基线**：greedy、eager、无 compile/graph；KV 池固定 1.79 GB。
-  `block_size=16` 是 CLI 默认值，但会关闭 FlashAttention 分页路径。
+  P3 之后 `block_size=16` 走 Triton paged decode + gather/varlen prefill，
+  `block_size=256` 走 FlashAttention 分页路径；两组的吞吐对照见 [P3](p3.md)。
 - **缓存口径**：默认 `--cache-mode cold`，每轮 measured run 前清空前缀缓存；
   MicroInfer 和 nano-vllm 都按这个口径重置，HF 没有前缀缓存。`shared-prefix` 会先
   prime 共享前缀，因此仍能测到跨请求复用。`--cache-mode warm` 保留重复 workload 的

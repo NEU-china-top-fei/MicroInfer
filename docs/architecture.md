@@ -103,6 +103,13 @@ dense 路径不改动 KV 池，packed 路径通过 `AttentionMetadata` 读写本
 - decode 的 Q offsets 由 metadata 懒生成，不再每层 `arange`。
 - `paged_attention_meta` 是唯一的生产入口：不做 host 校验、不 `.tolist()`，直接使用
   int32/连续 tensor。测试用的严格校验入口在 `tests/support/attention.py`。
+- **块大小与 kernel 解耦**：`block_size % 256 == 0` 时 decode 用 FlashAttention
+  分页 kernel；否则用 `triton_paged_attention.triton_paged_decode`（任意 2 的幂
+  block size，FP16/BF16/FP32，FP32 online softmax）。Triton 不可用或形状不满足
+  时才回到参考实现。
+- 小 block 的 prefill 用 `_gather_paged_kv` 把每个请求的有效 K/V 从物理块
+  gather 成连续 `[total_k, Hkv, D]`，再调用一次 `flash_attn_varlen_func`；
+  大 block 继续使用带 `block_table` 的 paged varlen 路径。
 - 分页参考后端的 FP16/BF16 输入在 FP32 中计算 QK、softmax、PV，输出转回输入 dtype。
 - 满足设备、dtype、head dimension 和块大小约束时，可调用 FlashAttention 分页后端。
 
@@ -117,6 +124,8 @@ decode 形状更稳定，compile 能把 elementwise/norm 等小 kernel 融合。
 调用 `RotaryCache.ensure()` 建好 cos/sin 表，避免 Dynamo 追踪 40k 行表构造。
 `AttentionMetadata`、fast KV 写入和显式 metadata 是这一阶段能 compile 的前提。
 FlashAttention 的 pybind op 仍是 opaque custom kernel 边界，compile 会在它周围分段。
+P3 的 Triton paged decode 是普通 Triton launch，Dynamo 可以完整追踪：`block_size=16`
+时 decode 编译成单图，`block_size=256` 的 FA 路径仍会产生多次 graph break。
 
 decode 的 metadata 使用 `_DecodeBuffers`：pinned CPU staging + 复用 device buffer，
 每个 step 原地填充 `input_ids/positions/slot_mapping/context_lens/block_tables`，
@@ -132,9 +141,11 @@ decode 的 metadata 使用 `_DecodeBuffers`：pinned CPU staging + 复用 device
   `long/div/mod` kernel 进入图内，replay 时根据新 slot 重新计算；
 - `graph.replay()` 后只取真实 batch 的 logits，再 argmax/sample。
 
-CUDA Graph 只用于 decode，prefill 仍 eager；它与 `use_compile` 互斥。唯一的架构性
-同步仍是最后 `tokens.tolist()`。`Sampler` 的 logits 有限性校验只在
-`debug_mode=True` 时执行。详细设计与结果见 [P2 文档](p2.md)；两种优化的原理和排查方法见
+CUDA Graph 只用于 decode，prefill 仍 eager；它与 `use_compile` 互斥。decode 可以走
+FlashAttention 分页 kernel（`block_size % 256 == 0`），也可以走 Triton 小 block
+kernel；两者都在 graph 前完成 JIT/allocator warmup。唯一的架构性同步仍是最后
+`tokens.tolist()`。`Sampler` 的 logits 有限性校验只在 `debug_mode=True` 时执行。
+详细设计与结果见 [P2 文档](p2.md) 和 [P3 文档](p3.md)；两种优化的原理和排查方法见
 [torch.compile 与 CUDA Graph](compile-and-cuda-graph.md)。
 
 ## 权重与验证

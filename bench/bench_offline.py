@@ -169,8 +169,8 @@ def main() -> int:
 
     if args.engine == "microinfer" and args.block_size % 256 != 0:
         print(
-            f"note: block_size={args.block_size} disables the FlashAttention paged "
-            "path in the current implementation"
+            f"note: block_size={args.block_size} uses the Triton paged decode "
+            "kernel (FlashAttention's paged kernel requires a multiple of 256)"
         )
 
     engine = build_engine(

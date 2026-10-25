@@ -228,19 +228,26 @@ class ModelRunner:
         if torch.device(self.device).type != "cuda":
             raise RuntimeError("CUDA Graph requires a CUDA device")
         from microinfer.layer.paged_attention import flash_attn_with_kvcache
+        from microinfer.layer.triton_paged_attention import HAS_TRITON
 
         head_dim = self.model.config.head_dim
         weight = self.model.embedding.weight
+        flash_ok = flash_attn_with_kvcache is not None and self.block_size % 256 == 0
+        triton_ok = (
+            HAS_TRITON
+            and self.block_size & (self.block_size - 1) == 0
+            and head_dim & (head_dim - 1) == 0
+        )
         if (
-            self.block_size % 256
-            or flash_attn_with_kvcache is None
+            not (flash_ok or triton_ok)
             or weight.dtype not in (torch.float16, torch.bfloat16)
             or head_dim > 256
             or head_dim % 8
         ):
             raise RuntimeError(
-                "CUDA Graph decode requires FlashAttention, CUDA FP16/BF16, "
-                "block_size multiple of 256, and head_dim <= 256 divisible by 8"
+                "CUDA Graph decode requires FlashAttention (block_size multiple of "
+                "256) or the Triton paged kernel, plus CUDA FP16/BF16 and "
+                "head_dim <= 256 divisible by 8"
             )
         rotary = getattr(self.model, "rotary", None)
         if rotary is not None:
