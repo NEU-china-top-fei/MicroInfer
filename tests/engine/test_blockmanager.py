@@ -242,6 +242,45 @@ def test_decode_completes_and_publishes_block(sequence_cls):
     assert manager.blocks[bid].hash == key
 
 
+def test_free_blocks_are_evicted_lru(sequence_cls):
+    manager = BlockManager(3, 4)
+    seqs = [
+        sequence_cls([1, 2, 3, 4]),
+        sequence_cls([11, 12, 13, 14]),
+        sequence_cls([21, 22, 23, 24]),
+    ]
+    for seq in seqs:
+        manager.allocate(seq, 0)
+        seed_completed_blocks(manager, seq, 1)
+    ids = [seq.block_table[0] for seq in seqs]
+    for seq in seqs:
+        manager.deallocate(seq)
+
+    # A prefix lookup refreshes the first block, so it must survive eviction.
+    probe = sequence_cls([1, 2, 3, 4, 99])
+    assert manager.can_allocate(probe) == 1
+    fresh = sequence_cls(list(range(31, 39)))
+    manager.allocate(fresh, 0)
+    assert fresh.block_table == ids[1:]
+    assert ids[0] not in fresh.block_table
+    assert manager.stats()["prefix_cache_evictions"] == 2
+
+
+def test_prefix_cache_stats_count_hits(sequence_cls):
+    manager = BlockManager(3, 4)
+    a = sequence_cls([1, 2, 3, 4, 5])
+    manager.allocate(a, 0)
+    seed_completed_blocks(manager, a, 1)
+    manager.deallocate(a)
+    b = sequence_cls([1, 2, 3, 4, 6])
+    assert manager.can_allocate(b) == 1
+    manager.allocate(b, 1)
+    stats = manager.stats()
+    assert stats["prefix_cache_hit_tokens"] == 4
+    assert stats["prefix_cache_hit_blocks"] == 1
+    assert stats["prefix_cache_entries"] == 1
+
+
 def test_reset_prefix_cache_requires_idle_pool(sequence_cls):
     manager = BlockManager(2, 4)
     seq = sequence_cls([1, 2, 3, 4])

@@ -14,6 +14,7 @@ dependencies = ["torch>=2.8", "numpy>=1.26", "xxhash>=3", "safetensors>=0.4", "t
 hf = ["transformers>=4.51,<6"]
 test = ["pytest>=8,<10", "ruff>=0.17", "transformers>=4.51,<6"]
 profile = ["tensorboard>=2.16", "torch-tb-profiler>=0.4,<0.5"]
+serve = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "httpx>=0.27"]
 
 [project.scripts]
 microinfer = "microinfer.__main__:main"

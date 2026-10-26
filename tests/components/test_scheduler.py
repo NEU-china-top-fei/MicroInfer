@@ -46,7 +46,7 @@ def test_chunked_prefill_discards_intermediate_sample(scheduler_factory, sequenc
     assert not manager.used_block_ids and scheduler.is_finished()
 
 
-def test_new_prefill_has_priority_over_running_decode(scheduler_factory, sequence_cls):
+def test_running_decode_and_waiting_prefill_are_mixed(scheduler_factory, sequence_cls):
     scheduler, _ = scheduler_factory(max_num_batched_tokens=4)
     a = sequence_cls([1])
     scheduler.add(a)
@@ -54,8 +54,10 @@ def test_new_prefill_has_priority_over_running_decode(scheduler_factory, sequenc
     b = sequence_cls([5, 6])
     scheduler.add(b)
     seqs, mode = scheduler.schedule()
-    assert mode is True and seqs == [b]
-    assert a.num_cached_tokens == 1 and a.num_scheduled_tokens == 0
+    assert mode is True and seqs == [a, b]
+    assert a.num_scheduled_tokens == 1 and not a.is_prefill
+    assert b.num_scheduled_tokens == 2 and b.is_prefill
+    assert scheduler.num_mixed_steps == 1
 
 
 def _step_args(scheduler, tokens):
@@ -63,14 +65,47 @@ def _step_args(scheduler, tokens):
     return seqs, tokens, mode
 
 
-def test_only_first_prefill_may_be_chunked(scheduler_factory, sequence_cls):
+def test_prefill_chunk_is_capped_independently_of_batch_budget(
+    scheduler_factory, sequence_cls
+):
+    scheduler, _ = scheduler_factory(
+        max_num_batched_tokens=16, max_num_prefill_tokens=3
+    )
+    seq = sequence_cls(list(range(8)))
+    scheduler.add(seq)
+    seqs, mode = scheduler.schedule()
+    assert mode and seqs == [seq] and seq.num_scheduled_tokens == 3
+    assert seq.status == SequenceStatus.WAITING
+
+
+def test_prefill_first_mode_keeps_old_policy(scheduler_factory, sequence_cls):
+    scheduler, _ = scheduler_factory(max_num_batched_tokens=4, mixed_batch=False)
+    a = sequence_cls([1])
+    scheduler.add(a)
+    scheduler.postprocess(*_step_args(scheduler, [2]))
+    b = sequence_cls([5, 6])
+    scheduler.add(b)
+    seqs, mode = scheduler.schedule()
+    assert mode is True and seqs == [b]
+    assert a.num_scheduled_tokens == 0 and a.completion_token_ids == [2]
+
+
+def test_prefill_fills_token_budget_in_arrival_order(scheduler_factory, sequence_cls):
     scheduler, _ = scheduler_factory(max_num_batched_tokens=4)
     a, b = sequence_cls([1, 2]), sequence_cls([3, 4, 5])
     scheduler.add(a)
     scheduler.add(b)
     seqs, mode = scheduler.schedule()
-    assert mode and seqs == [a]  # Two spare tokens do not split the second request.
-    assert not b.block_table and b.num_scheduled_tokens == 0
+    assert mode and seqs == [a, b]
+    assert a.num_scheduled_tokens == 2 and a.status == SequenceStatus.RUNNING
+    assert b.num_scheduled_tokens == 2 and b.status == SequenceStatus.WAITING
+    assert b.num_cached_tokens == 0
+
+    scheduler.postprocess(seqs, [10, 11], mode)
+    assert b.num_cached_tokens == 2 and b.completion_token_ids == []
+    seqs, mode = scheduler.schedule()
+    assert mode and seqs == [a, b]
+    assert a.num_scheduled_tokens == 1 and b.num_scheduled_tokens == 1
 
 
 def test_max_sequences_and_prefill_fcfs(scheduler_factory, sequence_cls):
@@ -84,19 +119,19 @@ def test_max_sequences_and_prefill_fcfs(scheduler_factory, sequence_cls):
     assert scheduler.schedule()[0] == [b]
 
 
-def test_decode_uses_sequence_limit_not_prefill_token_budget(
-    scheduler_factory, sequence_cls
-):
-    scheduler, _ = scheduler_factory(max_num_batched_tokens=1, max_num_seqs=2)
+def test_decode_respects_batched_token_budget(scheduler_factory, sequence_cls):
+    scheduler, _ = scheduler_factory(max_num_batched_tokens=2, max_num_seqs=2)
     a, b = sequence_cls([1]), sequence_cls([3])
     scheduler.add(a)
     scheduler.add(b)
-    scheduler.postprocess(*_step_args(scheduler, [2]))
-    scheduler.postprocess(*_step_args(scheduler, [4]))
+    scheduler.postprocess(*_step_args(scheduler, [2, 4]))
+
+    scheduler.max_num_batched_tokens = 1
     seqs, mode = scheduler.schedule()
-    assert not mode and seqs == [a, b]
-    assert sum(s.num_scheduled_tokens for s in seqs) == 2
-    assert all(not s.is_prefill for s in seqs)
+    assert not mode and seqs == [a]
+    assert a.num_scheduled_tokens == 1
+    scheduler.postprocess(seqs, [5], mode)
+    assert scheduler.schedule()[0] == [b]
 
 
 def test_completed_prefix_reused(scheduler_factory, sequence_cls):

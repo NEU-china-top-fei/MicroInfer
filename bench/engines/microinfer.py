@@ -30,12 +30,14 @@ class MicroInferEngine:
         num_blocks=64,
         max_num_seqs=64,
         max_num_batched_tokens=8192,
+        max_num_prefill_tokens=512,
         max_model_len=4096,
         cache_mode="cold",
         debug_mode=False,
         use_compile=False,
         fuse_weights=True,
         use_cuda_graph=False,
+        mixed_batch=True,
     ):
         if cache_mode not in ("cold", "warm"):
             raise ValueError("cache_mode must be cold or warm")
@@ -53,7 +55,9 @@ class MicroInferEngine:
         self.num_blocks = num_blocks
         self.max_num_seqs = max_num_seqs
         self.max_num_batched_tokens = max_num_batched_tokens
+        self.max_num_prefill_tokens = max_num_prefill_tokens
         self.max_model_len = max_model_len
+        self.mixed_batch = mixed_batch
         self.llm = None
         self.meta = {}
 
@@ -64,7 +68,9 @@ class MicroInferEngine:
         engine_config = EngineConfig(
             max_num_seqs=self.max_num_seqs,
             max_num_batched_tokens=self.max_num_batched_tokens,
+            max_num_prefill_tokens=self.max_num_prefill_tokens,
             max_model_len=self.max_model_len,
+            mixed_batch=self.mixed_batch,
         )
         self.llm = LLM.from_pretrained(
             self.model_path,
@@ -86,9 +92,7 @@ class MicroInferEngine:
         from microinfer.layer.triton_paged_attention import HAS_TRITON
 
         head_dim = self.llm.engine.model_runner.model.config.head_dim
-        flash_paged = (
-            flash_attn_with_kvcache is not None and self.block_size % 256 == 0
-        )
+        flash_paged = flash_attn_with_kvcache is not None and self.block_size % 256 == 0
         triton_paged = (
             HAS_TRITON
             and self.block_size & (self.block_size - 1) == 0
@@ -100,6 +104,8 @@ class MicroInferEngine:
             "kv_cache_mb": round(cache.num_bytes / 2**20, 2),
             "max_num_seqs": self.max_num_seqs,
             "max_num_batched_tokens": self.max_num_batched_tokens,
+            "max_num_prefill_tokens": self.max_num_prefill_tokens,
+            "mixed_batch": self.mixed_batch,
             "max_model_len": self.max_model_len,
             "flash_attn_paged": flash_paged,
             "triton_paged_decode": triton_paged and not flash_paged,
@@ -170,7 +176,9 @@ class MicroInferEngine:
             while not engine.is_finished():
                 engine.step()
                 steps += 1
-                peak_used_blocks = max(peak_used_blocks, len(block_manager.used_block_ids))
+                peak_used_blocks = max(
+                    peak_used_blocks, len(block_manager.used_block_ids)
+                )
                 collect_completion_times(
                     seqs, times, last_counts, time.perf_counter() - start
                 )

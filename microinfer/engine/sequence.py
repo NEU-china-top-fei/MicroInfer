@@ -33,6 +33,7 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens  # sample max
         self.ignore_eos = sampling_params.ignore_eos
         self.greedy = sampling_params.greedy
+        self.finish_reason: str | None = None
 
     def __len__(self):
         return self.num_tokens

@@ -6,8 +6,8 @@ Qwen3 推理引擎，支持 CPU 与单卡 CUDA，适合学习和实验推理引�
 
 ## 功能
 
-- 单进程连续批处理与 chunked prefill
-- 分页 KV 缓存、前缀复用、内存压力下的抢占重算
+- 单进程连续批处理、decode 优先的混合 batch 与 chunked prefill
+- 分页 KV 缓存、LRU 前缀复用、内存压力下的抢占重算
 - Qwen3 GQA、Q/K RMSNorm、split-half RoPE 与 SwiGLU
 - 温度采样、贪心生成、EOS / 长度停止与取消请求
 - 本地 safetensors 权重加载，支持 tied embeddings
@@ -16,6 +16,8 @@ Qwen3 推理引擎，支持 CPU 与单卡 CUDA，适合学习和实验推理引�
 - 可选 decode CUDA Graph / decode-only `torch.compile`
 - 任意 2 的幂 block size：大 block 走 FlashAttention 分页 kernel，小 block 走
   Triton paged decode + gather/varlen prefill
+- AsyncEngine 流式输出、请求取消、背压与混合调度
+- OpenAI 兼容 HTTP 服务（completions/chat/SSE/health/Prometheus metrics）
 
 默认采用 eager 执行；性能实验可开启 decode-only compile 或 CUDA Graph。
 暂不支持 Tensor Parallel、量化模型、滑动窗口注意力和 scaled RoPE。
@@ -33,6 +35,12 @@ python -m pip install -e '.[hf]'
 ```bash
 python -m pip install -e '.[hf,test]'
 python -m pytest -q
+```
+
+HTTP 服务需要额外依赖：
+
+```bash
+python -m pip install -e '.[hf,serve]'
 ```
 
 FlashAttention 为可选依赖。未安装或输入布局不满足约束时，使用 PyTorch 后端。
@@ -74,6 +82,20 @@ python -m microinfer --model models/Qwen3-0.6B \
 python examples/tiny_engine.py
 ```
 
+启动 OpenAI 兼容服务：
+
+```bash
+python -m microinfer.serve --model models/Qwen3-0.6B \
+  --block-size 16 --num-blocks 1024 --use-cuda-graph
+
+curl -N http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Hello","max_tokens":16,"stream":true}'
+```
+
+`/health` 返回队列/KV 状态，`/metrics` 输出 Prometheus text。详细设计见
+[P4 文档](docs/p4.md)。
+
 ## 接口约定
 
 - `generate` 接受文本列表或 `list[list[int]]`，结果保持输入顺序。
@@ -95,15 +117,16 @@ python examples/tiny_engine.py
 ```text
 microinfer/
   config/       模型、调度与采样配置
-  engine/       请求状态、物理块管理、调度与执行循环
+  engine/       请求状态、LRU 块管理、混合调度、异步执行
   layer/        模型算子与 attention 后端
   model/        Qwen3 模型及权重加载
+  serve/        OpenAI 兼容 FastAPI 服务与 metrics
   worker/       KV 张量存储
   runner.py     模型执行、metadata 与缓存绑定
-  llm.py        生成接口
+  llm.py        同步生成接口
 examples/       可运行示例
 scripts/        独立参考验证工具
-bench/          离线基准、引擎适配与 profiling
+bench/          离线/在线基准、引擎适配与 profiling
 tests/          单元、组件、集成测试与测试专用 adapter（tests/support/）
 docs/           架构与基准文档
 ```
@@ -139,9 +162,9 @@ python -m bench.report --input-dir results/bench
 
 | workload | eager | decode compile | decode CUDA Graph | HF | nano-vllm |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| single-short | 69.5 | 89.2 | **110.4** | 75.1 | 153.0 |
-| batch8-short | 497.5 | 576.0 | **678.1** | 531.3 | 964.5 |
-| long-prefill | 52.5 | 56.5 | **64.4** | 56.9 | 93.0 |
+| single-short | 69.5 | 89.2 | **110.4** | 75.1 | 152.6 |
+| batch8-short | 497.5 | 576.0 | **678.1** | 531.3 | 962.7 |
+| long-prefill | 52.5 | 56.5 | **64.4** | 56.9 | 93.7 |
 
 `block_size=16` 不再需要为了性能退回 256；小 block 路径使用 Triton paged decode +
 gather/varlen prefill（`num_blocks=1024`，KV 容量相同）：
@@ -158,10 +181,73 @@ gather/varlen prefill（`num_blocks=1024`，KV 容量相同）：
   decode 编译成单图，因此单流/batch8 上 compile 更快；高 batch/长上下文 graph
   与 `block_size=256` + FlashAttention 持平。
 - 4K context decode 的 TPOT：block16 12.6 ms vs block256 12.1 ms。
-- 完整消融和 profiling 见 [P1 优化记录](docs/p1.md)、
-  [P2 CUDA Graph](docs/p2.md) 与 [P3 Attention 快路径](docs/p3.md)；
-  两种执行优化的原理、取舍和排查方法见
-  [torch.compile 与 CUDA Graph](docs/compile-and-cuda-graph.md)。
+
+P4 在线并发（64 请求、128 prompt、16 output、block16 + CUDA Graph）：
+
+| 场景 | output tok/s | TTFT p99 | ITL p99 |
+| --- | ---: | ---: | ---: |
+| 同时到达，混合 batch | 1060.8 | 684 ms | 339 ms |
+| 同时到达，prefill-first | **1098.1** | **659 ms** | 348 ms |
+| 晚到 8×2048 prefill，混合 | 424.5 | — | **104 ms** |
+| 晚到 8×2048 prefill，prefill-first | **435.7** | — | 1098 ms |
+
+混合调度在晚到长 prefill 下把 decode 的秒级停顿压到约 100 ms；代价是约 3%
+吞吐和 2.5% 晚到 TTFT。完整数据、chunk 大小权衡和 HTTP 服务说明见
+[P4 调度与服务化](docs/p4.md)。
+
+### 当前版本 vs nano-vllm
+
+同一台机器、同一份 Qwen3-0.6B、cold cache、3 次运行中位数。MicroInfer 使用
+P4 代码 + `block_size=16`、`num_blocks=1024`、CUDA Graph、
+`max_num_prefill_tokens=8192`；nano-vllm 使用 `bb823b3` 的默认 compile + CUDA Graph、
+`block_size=256`、193 个 KV block。
+
+| workload | MicroInfer tok/s | nano-vllm tok/s | nano / MicroInfer |
+| --- | ---: | ---: | ---: |
+| single-short | 116.3 | 152.6 | 1.31× |
+| batch8-short | 695.3 | 962.7 | 1.38× |
+| batch32-mixed | 933.7 | 1406.0 | 1.51× |
+| shared-prefix | 723.8 | 938.9 | 1.30× |
+| long-prefill | 66.6 | 93.7 | 1.41× |
+
+| workload | MI TTFT | nano TTFT | MI TPOT | nano TPOT | MI peak | nano peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| single-short | 17.4 ms | 17.3 ms | 8.3 ms | 6.2 ms | 3.09 GB | 6.58 GB |
+| batch8-short | 65.8 ms | 46.9 ms | 9.7 ms | 7.1 ms | 3.13 GB | 6.61 GB |
+| batch32-mixed | 666.7 ms | 362.7 ms | 13.9 ms | 11.7 ms | 3.41 GB | 6.78 GB |
+| shared-prefix | 30.9 ms | 18.9 ms | 10.4 ms | 8.2 ms | 3.13 GB | 6.59 GB |
+| long-prefill | 164.9 ms | 121.4 ms | 10.2 ms | 7.1 ms | 3.18 GB | 6.63 GB |
+
+解读：
+
+- P0 时 MicroInfer 单流约为 nano-vllm 的 1/4，现在差距缩小到 **1.30–1.51×**；
+  batch32 和 long-prefill 仍是最明显的差距，主要来自 prefill TTFT 和 GPU 计算效率。
+- 显存差异主要来自 **KV 池容量**，不是算子或 attention 的显存效率：nano-vllm 用
+  90% GPU 自动分配 KV，193 个 256-token block ≈ **5.3 GiB KV**；MicroInfer 固定
+  1024 个 16-token block ≈ **1.75 GiB KV**。权重都约 1.2 GB，activation/graph
+  workspace 也在同一量级。batch32 只用了 MicroInfer KV 池的约 52%，所以这份额外
+  容量对当前 workload 的吞吐没有直接帮助；把 `num_blocks` 调到约 3072 就能得到
+  接近 nano 的显存占用。
+- 两者采样口径不同：MicroInfer 是 greedy，nano 参考实现没有 greedy，使用
+  `temperature=0.6`。因此这里比较的是吞吐，不是逐 token 输出一致性。
+- 复现时把 `--nano-root` 指向 nano-vllm checkout；详细口径见
+  [基准测试](docs/benchmarks.md)。
+
+把 MicroInfer 改成与 nano 相同的 KV 容量（`block_size=256`、`num_blocks=193`，
+KV 5.43 GiB）后，五组吞吐为 **112.3 / 694.7 / 922.0 / 703.1 / 65.2 tok/s**，
+相对 nano 仍是 **1.34–1.52×**，与 1.79 GiB KV 池基本一致。说明在这些 workload
+下显存容量不是瓶颈；更大的 KV 只在容量受限时有收益：64 个 512-token prompt 的
+在线测试中，1024 block 触发 1057 次前缀淘汰、292.8 tok/s、TTFT p99 3341 ms；
+3088 block 时淘汰为 0、311.3 tok/s、TTFT p99 2882 ms。
+
+同容量下 MicroInfer 峰值约 6.7–7.05 GB，nano 约 6.58–6.78 GB；MicroInfer 需要
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 才能稳定跑 batch32，多出的
+约 0.2–0.3 GB 来自 CUDA Graph pool 和 prefill 临时张量。
+
+完整消融和 profiling 见 [P1 优化记录](docs/p1.md)、
+[P2 CUDA Graph](docs/p2.md) 与 [P3 Attention 快路径](docs/p3.md)；
+两种执行优化的原理、取舍和排查方法见
+[torch.compile 与 CUDA Graph](docs/compile-and-cuda-graph.md)。
 
 默认使用 cold cache；`--cache-mode warm` 用于观察重复 workload 的前缀缓存稳态收益。
 profiling 默认输出 Chrome/Perfetto JSON + TensorBoard trace，`--export nsys` 输出
@@ -177,7 +263,8 @@ python -m bench.profile_runner --model /path/to/Qwen3-0.6B \
 完整结果、profiling 热点和可视化方式见 [docs/benchmarks.md](docs/benchmarks.md)；
 P1 的 `debug_mode` / `use_compile` 开关和消融记录见 [docs/p1.md](docs/p1.md)，
 decode CUDA Graph 的设计与结果见 [docs/p2.md](docs/p2.md)，小 block 的 Triton
-decode 与 gather/varlen prefill 见 [docs/p3.md](docs/p3.md)。
+decode 与 gather/varlen prefill 见 [docs/p3.md](docs/p3.md)，混合调度、
+异步引擎与 OpenAI 服务见 [docs/p4.md](docs/p4.md)。
 
 ## 参考项目
 

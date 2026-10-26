@@ -59,9 +59,7 @@ def _meta(args, engine) -> dict:
         "cache_mode": args.cache_mode,
         "debug_mode": args.debug_mode if args.engine == "microinfer" else False,
         "use_compile": args.use_compile if args.engine == "microinfer" else False,
-        "fuse_weights": (
-            args.fuse_weights if args.engine == "microinfer" else False
-        ),
+        "fuse_weights": (args.fuse_weights if args.engine == "microinfer" else False),
         "use_cuda_graph": (
             args.use_cuda_graph if args.engine == "microinfer" else False
         ),
@@ -117,6 +115,8 @@ def main() -> int:
     parser.add_argument("--num-blocks", type=int, default=64)
     parser.add_argument("--max-num-seqs", type=int, default=64)
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    parser.add_argument("--max-num-prefill-tokens", type=int, default=512)
+    parser.add_argument("--no-mixed-batch", action="store_false", dest="mixed_batch")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--nano-root", default=None)
@@ -182,6 +182,8 @@ def main() -> int:
         num_blocks=args.num_blocks,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        max_num_prefill_tokens=args.max_num_prefill_tokens,
+        mixed_batch=args.mixed_batch,
         max_model_len=args.max_model_len,
         attn_implementation=args.attn_implementation,
         nano_root=args.nano_root,

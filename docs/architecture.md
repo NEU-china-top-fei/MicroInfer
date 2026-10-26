@@ -1,6 +1,7 @@
 # 架构
 
-MicroInfer 将请求管理、模型执行和 KV 张量存储分离。引擎采用单进程、同步 eager 执行，
+MicroInfer 将请求管理、模型执行和 KV 张量存储分离。模型执行仍是单进程、同步
+eager/compile/graph；AsyncEngine 只提供异步请求接入和流式分发，step 仍然串行，
 同一模型实例的缓存不能并发写入。
 
 ## 生成流程
@@ -19,13 +20,24 @@ LLM.generate
 `LLM.from_pretrained` 读取本地配置、safetensors 和 tokenizer。
 `LLM.from_model` 接受已构造的 QwenModel 和 tokenizer，适合实验及模块化测试。
 
+流式/服务路径用 `AsyncEngine` 包住同一个 `LLMEngine`：
+
+```text
+AsyncEngine.add_request → scheduler.add → per-request asyncio.Queue
+AsyncEngine._run_loop → LLMEngine.step_events → StreamEvent
+                         (decode 与 prefill 在 mixed step 分开执行)
+```
+
 ## 模块边界
 
 | 模块 | 职责 |
 | --- | --- |
-| Sequence | token 历史、已计算长度、采样参数和请求状态 |
-| BlockManager | 物理块分配、引用计数、前缀 hash 和淘汰 |
-| Scheduler | 请求准入、prefill/decode 选择、预算、抢占和完成 |
+| Scheduler | decode 优先的混合调度、chunk 上限、round-robin、抢占 |
+| AsyncEngine | 异步准入、step task、流式队列、取消与背压 |
+| serve | OpenAI 兼容 HTTP/SSE 与 Prometheus metrics |
+| detokenizer | 累计 decode + UTF-8 stable-text buffer |
+| Sequence | token 历史、已计算长度、采样参数、finish reason 和请求状态 |
+| BlockManager | 物理块分配、引用计数、LRU 前缀 hash、淘汰和缓存指标 |
 | KVCache / LayerKVCache | 全局张量分配与单层零拷贝视图 |
 | CachedAttention | 写入本层缓存，接收每步 `AttentionMetadata` |
 | paged_attention_meta | 物理块读取、GQA 与带前缀偏移的 causal mask（生产入口） |
@@ -36,8 +48,15 @@ LLM.generate
 
 ## 调度与恢复
 
-调度策略参考 [nano-vllm bb823b3](https://github.com/GeeeekExplorer/nano-vllm/tree/bb823b3e06983d71485a8e1f23715ebd87d98ef8)：
-prefill 优先，prefill/decode 分轮执行。每批只有第一个 prefill 请求可以截成 chunk。
+调度策略最初参考 [nano-vllm bb823b3](https://github.com/GeeeekExplorer/nano-vllm/tree/bb823b3e06983d71485a8e1f23715ebd87d98ef8)，
+P4 改为 decode 优先的混合 batch：
+
+- 先给 running 请求各排 1 个 decode token，再填剩余 token budget 给 waiting prefill；
+- 单步 prefill 受 `max_num_prefill_tokens` 限制，长 prompt 切成多个 chunk；
+- decode 在 token budget 不足时 round-robin，避免固定饿死队尾；
+- mixed step 将 decode 与 prefill 拆成两次 runner 调用，decode 继续走 graph/compile；
+- `mixed_batch=False` 可回退到 pre-P4 的 prefill-first 策略做 A/B。
+
 未完成 chunk 的采样结果由 postprocess 丢弃；完成判断覆盖全部已知 token，包括历史生成 token。
 
 decode 缺块时抢占剩余 running 队尾，释放物理块并保留 token 历史，之后重新 prefill。
@@ -63,6 +82,9 @@ LayerKVCache 有两个写入入口：`write_checked` 支持 `-1` padding，并�
 `blocks/offsets`，不做 host 校验。生产 decode 走 `write_fast`，
 `debug_mode=True` 时走 `write_checked`。
 BlockManager 管引用计数，释放块不清零张量。计算只读取有效块表与 context lengths 指定的数据。
+P4 的 free list 是 lazy LRU heap，lookup 命中会刷新 recency；`block_id_to_hashes`
+反向索引让复用块时只删除自己的 hash，而不是扫描整张表。命中/淘汰 token 数通过
+`BlockManager.stats()` 暴露。
 
 Runner 每步构建一次 `AttentionMetadata`，包含 slot、位置、`cu_seqlens_q/k`、
 context lengths、block tables 和直接 prefill 标记；`ModelRunner.run_model` 把它显式传给
@@ -148,6 +170,18 @@ kernel；两者都在 graph 前完成 JIT/allocator warmup。唯一的架构性�
 详细设计与结果见 [P2 文档](p2.md) 和 [P3 文档](p3.md)；两种优化的原理和排查方法见
 [torch.compile 与 CUDA Graph](compile-and-cuda-graph.md)。
 
+### 异步与服务
+
+`AsyncEngine` 持有一个 `asyncio.Lock` 和一个后台 step task。`add_request`、
+`abort` 与 `step_events` 都串行化；模型执行通过 `asyncio.to_thread` 移出事件
+循环。每个请求有自己的 `asyncio.Queue`，`IncrementalDetokenizer` 把累计 token
+转成稳定文本增量，避免 UTF-8 字符跨 token 时先发出 `�`。
+
+背压由 `max_waiting` 控制，取消走 `scheduler.abort`，消费完终止事件后
+`release` 清理 per-request 状态。`microinfer/serve/` 在 AsyncEngine 上提供
+OpenAI 兼容端点、SSE、stop buffer 和 Prometheus text 指标。详细设计见
+[P4 文档](p4.md)。
+
 ## 权重与验证
 
 `load_model` 流式读取 safetensors，映射 Qwen3 参数名并支持 tied embeddings。
@@ -159,6 +193,7 @@ buffer；`--no-fuse-weights` 可关闭。
 `scripts/verify_checkpoint.py` 顺序加载真实模型，避免同时驻留两个完整模型，验证 logits 与生成 token。
 参考项目和改编代码的声明见 [第三方声明](../THIRD_PARTY_NOTICES.md)。
 
-`bench/` 是推理主路径之外的离线性能工具：它驱动 Scheduler/LLMEngine 直接收集 TTFT、TPOT、
-吞吐与显存，并提供 HF 与 nano-vllm 适配器。基线、profiling 热点和对比口径见
-[基准测试](benchmarks.md)。
+`bench/` 包含离线与在线性能工具：`bench_offline` 驱动 Scheduler/LLMEngine 收集
+TTFT、TPOT、吞吐与显存，并提供 HF/nano-vllm 适配器；`bench.online` 驱动 AsyncEngine
+测并发、晚到请求和混合调度。基线、profiling 热点和对比口径见
+[基准测试](benchmarks.md)，P4 调度结果见 [P4](p4.md)。

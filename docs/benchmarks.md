@@ -298,8 +298,34 @@ TTFT/TPOT/ITL/吞吐/显存）、`summary`（池化后的中位数与分位数�
 
 优化阶段的 debug/compile 开关和消融工作流见 [P1 优化工作流](p1.md)，
 decode CUDA Graph 的设计与结果见 [P2](p2.md)，小 block 的 Triton decode 与
-gather/varlen prefill 见 [P3](p3.md)；compile/graph 的原理与排查见
+gather/varlen prefill 见 [P3](p3.md)，混合调度/异步服务的在线数据见
+[P4](p4.md)；compile/graph 的原理与排查见
 [torch.compile 与 CUDA Graph](compile-and-cuda-graph.md)。
+
+### 在线并发（P4）
+
+`bench/online.py` 不经过 HTTP，直接驱动 `AsyncEngine`，用于隔离调度和模型时间：
+
+```bash
+python -m bench.online --model /path/to/Qwen3-0.6B \
+  --requests 64 --prompt-len 128 --output-len 16 \
+  --max-num-seqs 64 --max-num-batched-tokens 4096 \
+  --max-num-prefill-tokens 512 --block-size 16 --num-blocks 1024 \
+  --use-cuda-graph
+```
+
+RTX 4060 Laptop / Qwen3-0.6B bf16：
+
+| 场景 | output tok/s | TTFT p99 | ITL p99 |
+| --- | ---: | ---: | ---: |
+| 64 请求同时到达，混合 batch | 1060.8 | 684 ms | 339 ms |
+| 64 请求同时到达，prefill-first | **1098.1** | **659 ms** | 348 ms |
+| 16 个长 decode，晚到 8×2048 prefill，混合 | 424.5 | — | **104 ms** |
+| 同上，prefill-first | **435.7** | — | 1098 ms |
+
+关键结论：混合调度在晚到长 prefill 时把 decode 尾延迟从 1.1 s 压到约 0.1 s，
+代价是约 3% 吞吐和 2.5% 晚到 TTFT。chunk=256 可把尾延迟降到 63 ms，但吞吐再降
+约 7%。完整配置和 OpenAI 服务说明见 [P4](p4.md)。
 
 ## 7. 对比口径与注意事项
 
