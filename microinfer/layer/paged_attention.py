@@ -3,7 +3,11 @@ import math
 import torch
 
 from microinfer.layer.metadata import AttentionMetadata
-from microinfer.layer.triton_paged_attention import HAS_TRITON, triton_paged_decode
+from microinfer.layer.triton_paged_attention import (
+    HAS_TRITON,
+    triton_paged_decode,
+    triton_paged_prefill,
+)
 
 try:
     from flash_attn import (
@@ -95,6 +99,44 @@ def _gather_paged_kv(key_cache, value_cache, block_tables, contexts, block_size)
             ]
         )
     return torch.cat(keys), torch.cat(values)
+
+
+# Reading the cache in place wins once the copied prefix dwarfs the queries;
+# for a full-length prompt FlashAttention's gather copy stays faster.
+TRITON_PREFILL_RATIO = 4
+
+
+def _paged_prefill_triton(query, key_cache, value_cache, metadata, scale):
+    """Prefix-heavy prefill without materializing the paged K/V."""
+    if (
+        not HAS_TRITON
+        or not query.is_cuda
+        or query.dtype not in (torch.float16, torch.bfloat16)
+        or query.shape[-1] % 16
+        or metadata.block_tables is None
+        or metadata.cu_seqlens_q is None
+        or metadata.cu_seqlens_k is None
+        or metadata.max_seqlen_q <= 0
+    ):
+        return None
+    contexts = metadata.context_lens_cpu
+    q_lens = metadata.q_lens_cpu
+    if not contexts or len(contexts) != len(q_lens):
+        return None
+    if any(length <= 0 for length in contexts):
+        return None
+    if sum(contexts) < TRITON_PREFILL_RATIO * sum(q_lens):
+        return None
+    return triton_paged_prefill(
+        query,
+        key_cache,
+        value_cache,
+        metadata.cu_seqlens_q,
+        metadata.cu_seqlens_k,
+        metadata.block_tables,
+        max_seqlen_q=metadata.max_seqlen_q,
+        scale=scale,
+    )
 
 
 def _paged_prefill_gather(query, key_cache, value_cache, metadata, scale):
@@ -233,6 +275,9 @@ def paged_attention_meta(
             )
 
     if metadata.is_prefill:
+        paged = _paged_prefill_triton(query, key_cache, value_cache, metadata, scale)
+        if paged is not None:
+            return paged
         gathered = _paged_prefill_gather(query, key_cache, value_cache, metadata, scale)
         if gathered is not None:
             return gathered

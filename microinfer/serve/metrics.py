@@ -80,6 +80,17 @@ class ServiceMetrics:
             ),
             "microinfer_preemptions": engine_stats.get("num_preemptions", 0),
             "microinfer_steps": engine_stats.get("num_steps", 0),
+            "microinfer_spec_steps": engine_stats.get("num_spec_steps", 0),
+            "microinfer_spec_draft_tokens": engine_stats.get(
+                "num_spec_draft_tokens", 0
+            ),
+            "microinfer_spec_accepted_tokens": engine_stats.get(
+                "num_spec_accepted_tokens", 0
+            ),
+            "microinfer_spec_acceptance_rate": engine_stats.get(
+                "spec_acceptance_rate"
+            )
+            or 0.0,
         }
         for name, value in gauges.items():
             lines.extend([f"# TYPE {name} gauge", f"{name} {value}"])

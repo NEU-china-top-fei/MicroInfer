@@ -40,7 +40,7 @@ CUDA Graph:
    → 整段 forward 只需一次 CPU 调用
 ```
 
-两者不是替代关系：
+两者用途不同：
 
 | | torch.compile | CUDA Graph |
 | --- | --- | --- |
@@ -55,7 +55,7 @@ CUDA Graph:
 
 ### 1.1 它做了什么
 
-`torch.compile(fn)` 不是简单的 JIT：
+`torch.compile(fn)` 包含的不只是 JIT：
 
 ```text
 Python bytecode
@@ -410,7 +410,7 @@ Graph 捕获要求 decode 走 FlashAttention 或 Triton paged kernel：
   `block_size`、`head_dim` 为 2 的幂；
 - `head_dim <= 256` 且 `head_dim % 8 == 0`。
 
-不满足时 `capture_cuda_graphs()` 会给出明确错误，而不是静默退回 eager。
+不满足时 `capture_cuda_graphs()` 会给出明确错误，不会静默退回 eager。
 
 原因：reference decode 路径里有 `.tolist()`/host 同步，无法被 graph 捕获。
 小 block 的 Triton kernel 与 graph 的配合见 [P3 文档](p3.md)。
@@ -583,7 +583,7 @@ TORCH_LOGS=graph_breaks python -m microinfer --model /path/to/Qwen3-0.6B \
 
 10. **如果 batch32 graph 反而比 compile 慢？**
     GPU 接近计算受限，compile 的算子融合收益大于 graph 的 launch 消除；这是选择
-    两种优化的边界，不是实现错误。
+    两种优化的边界，语义没有差异。
 
 ---
 

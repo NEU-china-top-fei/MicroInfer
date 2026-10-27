@@ -22,6 +22,9 @@ class Scheduler:
         self.num_prefill_steps = 0
         self.num_decode_steps = 0
         self.num_mixed_steps = 0
+        self.num_spec_steps = 0
+        self.num_spec_draft_tokens = 0
+        self.num_spec_accepted_tokens = 0
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -35,6 +38,14 @@ class Scheduler:
             "num_prefill_steps": self.num_prefill_steps,
             "num_decode_steps": self.num_decode_steps,
             "num_mixed_steps": self.num_mixed_steps,
+            "num_spec_steps": self.num_spec_steps,
+            "num_spec_draft_tokens": self.num_spec_draft_tokens,
+            "num_spec_accepted_tokens": self.num_spec_accepted_tokens,
+            "spec_acceptance_rate": (
+                self.num_spec_accepted_tokens / self.num_spec_draft_tokens
+                if self.num_spec_draft_tokens
+                else None
+            ),
         }
 
     def add(self, seq: Sequence):
@@ -126,7 +137,7 @@ class Scheduler:
             scheduled.append(seq)
             budget -= 1
         # Round-robin: when the token budget cannot cover every running request,
-        # the ones served this step move to the back instead of starving peers.
+        # the ones served this step move to the back so peers get a turn.
         self.running.extend(scheduled)
         return scheduled_seqs + scheduled, budget
 
@@ -160,6 +171,43 @@ class Scheduler:
                 # prefills to make progress without repeatedly reordering.
                 break
         return scheduled_seqs
+
+    def record_spec_attempt(self, seqs: list[Sequence]):
+        self.num_spec_steps += 1
+        self.num_spec_draft_tokens += sum(len(seq.spec_draft_ids) for seq in seqs)
+
+    def commit_spec(self, seqs: list[Sequence], accepted: list[int]):
+        """Commit accepted draft tokens; the caller runs a normal decode next.
+
+        The last accepted draft is left "uncached" so the normal decode step
+        processes it and samples the next token with the same kernel as
+        non-speculative generation. This keeps partial acceptance exact.
+        """
+        for seq, count in zip(seqs, accepted):
+            drafts = len(seq.spec_draft_ids)
+            if count < 0 or count > drafts:
+                raise ValueError("invalid speculative acceptance count")
+            base = seq.spec_base_len
+            seq.token_ids = seq.token_ids[: base + count]
+            seq.num_tokens = len(seq.token_ids)
+            seq.num_scheduled_tokens = 1 + count
+            self.block_manager.hash_blocks(seq)
+            seq.num_cached_tokens = base + count - 1
+            seq.num_scheduled_tokens = 0
+            seq.spec_draft_ids = ()
+            seq.spec_base_len = 0
+            seq.is_prefill = False
+            seq.last_token = seq.token_ids[-1]
+            self.block_manager.trim(seq)
+            self.num_spec_accepted_tokens += count
+            if (
+                seq.num_completion_tokens >= seq.max_tokens
+                or len(seq) >= self.max_length
+            ):
+                seq.finish_reason = "length"
+                seq.status = SequenceStatus.FINISHED
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
 
     def preempt(self, seq: Sequence):
         self.num_preemptions += 1

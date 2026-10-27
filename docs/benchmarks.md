@@ -3,7 +3,7 @@
 本页记录 MicroInfer 的离线推理基线、对比方法和 profiling 结果。所有数字都可复现；
 原始 JSON 写入 `results/bench/`（已在 `.gitignore` 中忽略），提交的是环境、命令和汇总表。
 
-> 这是**离线引擎**基准，不是 serving 基准。并发到达、排队、流式输出和 P99 端到端时延
+> 这是**离线引擎**基准，不覆盖 serving。并发到达、排队、流式输出和 P99 端到端时延
 > 会在服务化完成后单独测量。
 
 ## 1. 测量环境
@@ -90,7 +90,7 @@ MicroInfer bs256 的缓存/容量指标：
 
 ### 解读
 
-1. **decode 的瓶颈是每步固定开销，不是 attention。**
+1. **decode 的瓶颈是每步固定开销，attention 本身占比很小。**
    MicroInfer bs256 的单流吞吐只有 HF eager 的 0.50×、nano-vllm 的 0.24×；
    batch-8 分别是 0.49× 和 0.27×。TPOT 26.5 ms vs HF 13.2 / nano 6.2，
    而 TTFT 30.3 ms 与 HF 15.5 / nano 16.7 的差距相对小。差距集中在 decode。
@@ -112,7 +112,7 @@ MicroInfer bs256 的缓存/容量指标：
    （0.92×）。nano-vllm 仍有 3.06× 优势。
 5. **batch32 上 MicroInfer 快于 HF，但不能当作通用结论。**
    HF 基线是静态左 padding batch，会把所有 prompt 补到 384 并一次性 prefill；
-   TTFT 1.05 s 和显存 2.8 GB 都包含 padding 与静态 batch 的代价。真正公平的
+   TTFT 1.05 s 和显存 2.8 GB 都包含 padding 与静态 batch 的代价。更公平的
    单流/batch-8 对比中，HF 仍然更快。nano-vllm 在 batch32 上是 MicroInfer 的 4.17×。
 6. **显存占用可解释。** MicroInfer 固定 1.79 GB KV + ~1.2 GB 权重 ≈ 3.0 GB；
    batch32 的 KV peak 78.1%，activation 让峰值到 3.24 GB；long-prefill 的
@@ -133,7 +133,7 @@ MicroInfer bs256 的缓存/容量指标：
 | long-prefill | 21.7 | 37.0 | 659.4 | 33.6 |
 
 warm 的 `long-prefill` 只 prefill 最后一个不足 256 token 的块，所以 TTFT 看起来很好；
-这不是冷请求的真实成本。cold 才是默认口径；warm 可用于观察稳态前缀命中收益。
+warm 不能代表冷请求成本。cold 才是默认口径；warm 用于观察稳态前缀命中收益。
 
 ## 5. Profiling
 
@@ -182,7 +182,7 @@ python -m bench.profile_runner --model /path/to/Qwen3-0.6B \
 ```
 
 一次 2048-token prefill（1 个输出 token）的 profiled wall 为 665 ms，CUDA 时间 645 ms；
-`cudaLaunchKernel` 只有 3,822 次，说明这一步是 **GPU-bound**，不是 launch-bound。
+`cudaLaunchKernel` 只有 3,822 次，说明这一步是 **GPU-bound**，launch 开销不占主导。
 主要 kernel：
 
 | activity | CUDA 时间 | 占比 | 调用数 |
@@ -255,7 +255,7 @@ TensorBoard trace，`--export run` 只跑 workload 不做 profiling。trace 较�
 
 ## 6. 复现
 
-以下命令都在仓库根目录运行（`bench/` 不是必须安装的运行时包）。
+以下命令都在仓库根目录运行（`bench/` 无需安装为运行时包）。
 
 ```bash
 # 安装（需要 HF tokenizer 与 transformers 基线；profile 可选）
@@ -299,7 +299,7 @@ TTFT/TPOT/ITL/吞吐/显存）、`summary`（池化后的中位数与分位数�
 优化阶段的 debug/compile 开关和消融工作流见 [P1 优化工作流](p1.md)，
 decode CUDA Graph 的设计与结果见 [P2](p2.md)，小 block 的 Triton decode 与
 gather/varlen prefill 见 [P3](p3.md)，混合调度/异步服务的在线数据见
-[P4](p4.md)；compile/graph 的原理与排查见
+[P4](p4.md)，n-gram/draft-model 投机解码见 [P5](p5.md)；compile/graph 的原理与排查见
 [torch.compile 与 CUDA Graph](compile-and-cuda-graph.md)。
 
 ### 在线并发（P4）
@@ -338,6 +338,9 @@ RTX 4060 Laptop / Qwen3-0.6B bf16：
 - **MicroInfer 基线**：greedy、eager、无 compile/graph；KV 池固定 1.79 GB。
   P3 之后 `block_size=16` 走 Triton paged decode + gather/varlen prefill，
   `block_size=256` 走 FlashAttention 分页路径；两组的吞吐对照见 [P3](p3.md)。
+  P6 在低并行 decode 上启用 split-K，prefix-heavy prefill 改走
+  `triton_paged_prefill`（不再 gather），所以共享前缀与长上下文的口径见
+  [P6](p6.md)。
 - **缓存口径**：默认 `--cache-mode cold`，每轮 measured run 前清空前缀缓存；
   MicroInfer 和 nano-vllm 都按这个口径重置，HF 没有前缀缓存。`shared-prefix` 会先
   prime 共享前缀，因此仍能测到跨请求复用。`--cache-mode warm` 保留重复 workload 的

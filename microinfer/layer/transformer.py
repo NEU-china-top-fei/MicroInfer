@@ -6,7 +6,28 @@ from torch.nn import functional as F
 
 from microinfer.layer.cached_attention import CachedAttention
 from microinfer.layer.norm import FuseLayerNorm
-from microinfer.layer.rope import RotaryCache
+from microinfer.layer.rope import RotaryCache, _rotate
+
+
+@torch.compile(dynamic=True)
+def _compiled_swiglu(x):
+    gate, up = x.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
+
+@torch.compile(dynamic=True)
+def _compiled_qk_norm_rope(
+    q, k, q_weight, k_weight, positions, cos_table, sin_table, eps, interleaved
+):
+    """One compiled region for Q/K RMSNorm + RoPE along the prefill path."""
+    q = F.rms_norm(q, (q.shape[-1],), q_weight, eps)
+    k = F.rms_norm(k, (k.shape[-1],), k_weight, eps)
+    index = positions.long()
+    cosine = cos_table.index_select(0, index).unsqueeze(-2)
+    sine = sin_table.index_select(0, index).unsqueeze(-2)
+    return _rotate(q, cosine, sine, interleaved), _rotate(
+        k, cosine, sine, interleaved
+    )
 
 
 class FFN(nn.Module):
@@ -21,6 +42,7 @@ class FFN(nn.Module):
         )
         self.register_buffer("gate_up_weight", None, persistent=False)
         self.register_buffer("gate_up_bias", None, persistent=False)
+        self.compile_ops = False
 
     @torch.no_grad()
     def fuse_weights(self):
@@ -60,6 +82,8 @@ class FFN(nn.Module):
     def forward(self, x):
         if self.gate_up_weight is not None:
             gate_up = F.linear(x, self.gate_up_weight, self.gate_up_bias)
+            if self.compile_ops:
+                return self.down_project(_compiled_swiglu(gate_up))
             gate, up = gate_up.chunk(2, dim=-1)
         else:
             gate, up = self.gate_project(x), self.up_project(x)
@@ -183,10 +207,24 @@ class Attention(nn.Module):
             q = self.q_proj(x).reshape(*shape, self.num_q_head, self.head_dim)
             k = self.k_proj(x).reshape(*shape, self.num_kv_head, self.head_dim)
             v = self.v_proj(x).reshape(*shape, self.num_kv_head, self.head_dim)
-        q, _ = self.q_norm(q)
-        k, _ = self.k_norm(k)
-        q = self.rotary.apply(q, position)
-        k = self.rotary.apply(k, position)
+        if metadata is not None and metadata.is_prefill and self.q_norm.compile_ops:
+            cos_table, sin_table = self.rotary.tables(x.device)
+            q, k = _compiled_qk_norm_rope(
+                q,
+                k,
+                self.q_norm.norm.weight,
+                self.k_norm.norm.weight,
+                position,
+                cos_table,
+                sin_table,
+                self.q_norm.eps,
+                self.rotary.interleaved,
+            )
+        else:
+            q, _ = self.q_norm(q)
+            k, _ = self.k_norm(k)
+            q = self.rotary.apply(q, position)
+            k = self.rotary.apply(k, position)
         if x.ndim == 2:
             if metadata is None:
                 raise ValueError("packed attention requires AttentionMetadata")

@@ -117,6 +117,12 @@ def main() -> int:
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
     parser.add_argument("--max-num-prefill-tokens", type=int, default=512)
     parser.add_argument("--no-mixed-batch", action="store_false", dest="mixed_batch")
+    parser.add_argument("--use-speculative", action="store_true")
+    parser.add_argument("--draft-model", default=None)
+    parser.add_argument(
+        "--draft-layers", type=int, default=None, help="use a layer-pruned native draft"
+    )
+    parser.add_argument("--draft-num-blocks", type=int, default=None)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--attn-implementation", default="sdpa")
     parser.add_argument("--nano-root", default=None)
@@ -138,6 +144,7 @@ def main() -> int:
         action="store_true",
         help="compile model forward (experimental; MicroInfer only)",
     )
+    parser.add_argument("--compile-ops", action="store_true")
     parser.add_argument(
         "--no-fuse-weights",
         action="store_false",
@@ -193,6 +200,11 @@ def main() -> int:
         use_compile=args.use_compile,
         fuse_weights=args.fuse_weights,
         use_cuda_graph=args.use_cuda_graph,
+        compile_ops=args.compile_ops or None,
+        use_speculative=args.use_speculative,
+        draft_model_path=args.draft_model,
+        draft_layers=args.draft_layers,
+        draft_num_blocks=args.draft_num_blocks,
     ).load()
 
     workloads = build_workloads(names, seed=args.seed)

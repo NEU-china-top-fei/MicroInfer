@@ -15,8 +15,11 @@ Qwen3 推理引擎，支持 CPU 与单卡 CUDA，适合学习和实验推理引�
 - 可复现离线 benchmark（TTFT、TPOT、吞吐、显存），含 HF 与 nano-vllm 基线
 - 可选 decode CUDA Graph / decode-only `torch.compile`
 - 任意 2 的幂 block size：大 block 走 FlashAttention 分页 kernel，小 block 走
-  Triton paged decode + gather/varlen prefill
+  Triton paged decode（低并发时 split-K）与 paged prefill，长全量 prompt 回退到
+  gather + varlen FlashAttention
 - AsyncEngine 流式输出、请求取消、背压与混合调度
+- greedy n-gram 与 draft-model 投机解码（opt-in），draft 可层裁剪并复用 paged KV/CUDA Graph
+- 可选 per-op `torch.compile`（RMSNorm/SwiGLU/RoPE），可与 CUDA Graph 共存
 - OpenAI 兼容 HTTP 服务（completions/chat/SSE/health/Prometheus metrics）
 
 默认采用 eager 执行；性能实验可开启 decode-only compile 或 CUDA Graph。
@@ -74,6 +77,11 @@ CPU 运行使用 `device="cpu", dtype="float32"`。
 ```bash
 python -m microinfer --model models/Qwen3-0.6B \
   --prompt 'Hello, my name is' --max-tokens 16 --greedy --device cuda
+
+# 重复/复制/模板类输出可开启 greedy n-gram 投机解码
+python -m microinfer --model models/Qwen3-0.6B \
+  --prompt 'Repeat exactly: ...' --max-tokens 32 --greedy \
+  --block-size 16 --num-blocks 1024 --use-speculative
 ```
 
 不下载模型的端到端示例：
@@ -87,6 +95,9 @@ python examples/tiny_engine.py
 ```bash
 python -m microinfer.serve --model models/Qwen3-0.6B \
   --block-size 16 --num-blocks 1024 --use-cuda-graph
+
+# 可选：开启 greedy 投机解码
+# python -m microinfer.serve ... --use-speculative
 
 curl -N http://127.0.0.1:8000/v1/completions \
   -H 'Content-Type: application/json' \
@@ -157,7 +168,7 @@ python -m bench.run_all --model /path/to/Qwen3-0.6B --runs 3 --warmup 1
 python -m bench.report --input-dir results/bench
 ```
 
-当前 RTX 4060 Laptop / Qwen3-0.6B、block_size=256、cold cache 的结果
+P2 阶段（RTX 4060 Laptop / Qwen3-0.6B、block_size=256、cold cache）的结果
 （output tok/s）：
 
 | workload | eager | decode compile | decode CUDA Graph | HF | nano-vllm |
@@ -166,8 +177,8 @@ python -m bench.report --input-dir results/bench
 | batch8-short | 497.5 | 576.0 | **678.1** | 531.3 | 962.7 |
 | long-prefill | 52.5 | 56.5 | **64.4** | 56.9 | 93.7 |
 
-`block_size=16` 不再需要为了性能退回 256；小 block 路径使用 Triton paged decode +
-gather/varlen prefill（`num_blocks=1024`，KV 容量相同）：
+P3 阶段起，`block_size=16` 不再需要为了性能退回 256；小 block 路径使用
+Triton paged decode + prefill（`num_blocks=1024`，KV 容量相同）：
 
 | workload | bs16 eager | bs16 compile | bs16 graph | bs256 graph |
 | --- | ---: | ---: | ---: | ---: |
@@ -195,48 +206,99 @@ P4 在线并发（64 请求、128 prompt、16 output、block16 + CUDA Graph）�
 吞吐和 2.5% 晚到 TTFT。完整数据、chunk 大小权衡和 HTTP 服务说明见
 [P4 调度与服务化](docs/p4.md)。
 
+### P5 投机解码
+
+`--use-speculative` 使用 n-gram prompt lookup 提议 draft，再一次性验证。当前是
+greedy-only、opt-in；验证 logits 只决定接受哪些 draft，下一 token 仍由普通 decode
+生成，测试 workload 上输出与 baseline 一致。
+
+| prompt | baseline tok/s | speculative tok/s | 加速 | 接受率 |
+| --- | ---: | ---: | ---: | ---: |
+| 重复句子（32 tokens） | 117.3 | **261.8** | **2.23×** | 100% |
+| `Hello, my name is` | 117.8 | 111.6 | 0.95× | 0% |
+
+重复/复制/模板类输出收益最大；随机创作没有 draft 命中时会有约 5% 验证开销。
+
+也支持独立 draft model：
+
+```bash
+# HF draft
+python -m microinfer --model /path/to/Qwen3-1.7B \
+  --draft-model /path/to/Qwen3-0.6B --prompt '...' --greedy --use-speculative
+
+# native draft：层裁剪 + MicroInfer paged KV + CUDA Graph
+python -m microinfer --model /path/to/Qwen3-1.7B \
+  --draft-model /path/to/Qwen3-0.6B --draft-layers 8 \
+  --prompt '...' --greedy --use-speculative
+
+# 对 target 和 draft 都做 per-op compile
+python -m microinfer --model /path/to/Qwen3-1.7B \
+  --draft-model /path/to/Qwen3-0.6B --draft-layers 28 \
+  --prompt '...' --greedy --use-speculative --compile-ops --use-cuda-graph
+```
+
+真实 6 条文本 prompt、4 路并发、target 1.7B 的测试：
+
+| draft | spec / baseline | acceptance |
+| --- | ---: | ---: |
+| HF 0.6B | 0.52× | 71% |
+| native 0.6B | **0.69×** | 60–71% |
+| native pruned 8/28 | 0.43× | 0% |
+| native pruned 20/28 | 0.47× | 10% |
+
+把 draft 换成 native runner 有明显改善，但 0.6B draft 在此 8GB 卡上仍无法超过
+baseline；层裁剪到 8/20 层又损失了接受率。per-op compile 把 target baseline 从 159 提到 178 tok/s，spec 从 109 提到
+123 tok/s，但两者同比提升，spec/baseline 仍约 0.68×。draft 通路已经完整，要获得收益需要更小
+且与 target 对齐的蒸馏 draft，或更大的 target。4B target 的 bf16 权重约 7.5 GiB，
+在这张 8 GB 卡上无法与 KV/draft 共存；要跑 4B 需要先做 int4/FP8 权重或 offload。
+完整结果见 [P5](docs/p5.md)。
+
 ### 当前版本 vs nano-vllm
 
 同一台机器、同一份 Qwen3-0.6B、cold cache、3 次运行中位数。MicroInfer 使用
-P4 代码 + `block_size=16`、`num_blocks=1024`、CUDA Graph、
+P6 代码 + `block_size=16`、`num_blocks=1024`、`--compile-ops --use-cuda-graph`、
 `max_num_prefill_tokens=8192`；nano-vllm 使用 `bb823b3` 的默认 compile + CUDA Graph、
 `block_size=256`、193 个 KV block。
 
 | workload | MicroInfer tok/s | nano-vllm tok/s | nano / MicroInfer |
 | --- | ---: | ---: | ---: |
-| single-short | 116.3 | 152.6 | 1.31× |
-| batch8-short | 695.3 | 962.7 | 1.38× |
-| batch32-mixed | 933.7 | 1406.0 | 1.51× |
-| shared-prefix | 723.8 | 938.9 | 1.30× |
-| long-prefill | 66.6 | 93.7 | 1.41× |
+| single-short | 148.3 | 154.1 | 1.04× |
+| batch8-short | 906.0 | 974.7 | 1.08× |
+| batch32-mixed | 1385.2 | 1412.2 | 1.02× |
+| shared-prefix | 918.7 | 927.4 | 1.01× |
+| long-prefill | 88.3 | 93.8 | 1.06× |
 
 | workload | MI TTFT | nano TTFT | MI TPOT | nano TPOT | MI peak | nano peak |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| single-short | 17.4 ms | 17.3 ms | 8.3 ms | 6.2 ms | 3.09 GB | 6.58 GB |
-| batch8-short | 65.8 ms | 46.9 ms | 9.7 ms | 7.1 ms | 3.13 GB | 6.61 GB |
-| batch32-mixed | 666.7 ms | 362.7 ms | 13.9 ms | 11.7 ms | 3.41 GB | 6.78 GB |
-| shared-prefix | 30.9 ms | 18.9 ms | 10.4 ms | 8.2 ms | 3.13 GB | 6.59 GB |
-| long-prefill | 164.9 ms | 121.4 ms | 10.2 ms | 7.1 ms | 3.18 GB | 6.63 GB |
+| single-short | 15.2 ms | 17.0 ms | 6.5 ms | 6.1 ms | 3.09 GB | 6.58 GB |
+| batch8-short | 49.9 ms | 46.5 ms | 7.5 ms | 7.0 ms | 3.11 GB | 6.61 GB |
+| batch32-mixed | 376.7 ms | 361.5 ms | 11.5 ms | 11.7 ms | 3.28 GB | 6.78 GB |
+| shared-prefix | 19.4 ms | 19.4 ms | 8.4 ms | 8.3 ms | 3.09 GB | 6.59 GB |
+| long-prefill | 123.8 ms | 122.9 ms | 7.6 ms | 7.0 ms | 3.14 GB | 6.63 GB |
 
 解读：
 
-- P0 时 MicroInfer 单流约为 nano-vllm 的 1/4，现在差距缩小到 **1.30–1.51×**；
-  batch32 和 long-prefill 仍是最明显的差距，主要来自 prefill TTFT 和 GPU 计算效率。
-- 显存差异主要来自 **KV 池容量**，不是算子或 attention 的显存效率：nano-vllm 用
+- P0 时 MicroInfer 单流约为 nano-vllm 的 1/4；P5 的 per-op compile 把它缩小到
+  **1.01–1.12×**。P6 再加入 split-K paged decode、paged prefill（去掉 gather）、
+  prefill QK-Norm+RoPE 融合和 graph 内 greedy argmax 后，五组为
+  **1.01–1.08×**；shared-prefix 的 TTFT 已与 nano 持平（19.4 ms），long-prefill
+  从 1.12× 收到 1.06×。剩余差距主要是 batch8 的 prefill/固定开销和长上下文的
+  decode kernel。
+- 显存差异主要来自 **KV 池容量**：nano-vllm 用
   90% GPU 自动分配 KV，193 个 256-token block ≈ **5.3 GiB KV**；MicroInfer 固定
   1024 个 16-token block ≈ **1.75 GiB KV**。权重都约 1.2 GB，activation/graph
   workspace 也在同一量级。batch32 只用了 MicroInfer KV 池的约 52%，所以这份额外
   容量对当前 workload 的吞吐没有直接帮助；把 `num_blocks` 调到约 3072 就能得到
   接近 nano 的显存占用。
 - 两者采样口径不同：MicroInfer 是 greedy，nano 参考实现没有 greedy，使用
-  `temperature=0.6`。因此这里比较的是吞吐，不是逐 token 输出一致性。
+  `temperature=0.6`。因此这里只比较吞吐，不比较逐 token 输出一致性。
 - 复现时把 `--nano-root` 指向 nano-vllm checkout；详细口径见
   [基准测试](docs/benchmarks.md)。
 
 把 MicroInfer 改成与 nano 相同的 KV 容量（`block_size=256`、`num_blocks=193`，
 KV 5.43 GiB）后，五组吞吐为 **112.3 / 694.7 / 922.0 / 703.1 / 65.2 tok/s**，
 相对 nano 仍是 **1.34–1.52×**，与 1.79 GiB KV 池基本一致。说明在这些 workload
-下显存容量不是瓶颈；更大的 KV 只在容量受限时有收益：64 个 512-token prompt 的
+下显存容量没有成为瓶颈；更大的 KV 只在容量受限时有收益：64 个 512-token prompt 的
 在线测试中，1024 block 触发 1057 次前缀淘汰、292.8 tok/s、TTFT p99 3341 ms；
 3088 block 时淘汰为 0、311.3 tok/s、TTFT p99 2882 ms。
 
@@ -264,7 +326,9 @@ python -m bench.profile_runner --model /path/to/Qwen3-0.6B \
 P1 的 `debug_mode` / `use_compile` 开关和消融记录见 [docs/p1.md](docs/p1.md)，
 decode CUDA Graph 的设计与结果见 [docs/p2.md](docs/p2.md)，小 block 的 Triton
 decode 与 gather/varlen prefill 见 [docs/p3.md](docs/p3.md)，混合调度、
-异步引擎与 OpenAI 服务见 [docs/p4.md](docs/p4.md)。
+异步引擎与 OpenAI 服务见 [docs/p4.md](docs/p4.md)，n-gram 投机解码见
+[docs/p5.md](docs/p5.md)，split-K decode / paged prefill / 预填充融合与 graph
+边界优化见 [docs/p6.md](docs/p6.md)。
 
 ## 参考项目
 

@@ -31,6 +31,10 @@ class LLM:
         use_compile=None,
         fuse_weights=True,
         use_cuda_graph=None,
+        compile_ops=None,
+        use_speculative=None,
+        draft_model=None,
+        speculator=None,
     ):
         from microinfer.engine.blockmanager import BlockManager
         from microinfer.engine.llm_engine import LLMEngine
@@ -49,6 +53,12 @@ class LLM:
             overrides["use_compile"] = use_compile
         if use_cuda_graph is not None:
             overrides["use_cuda_graph"] = use_cuda_graph
+        if compile_ops is not None:
+            overrides["compile_ops"] = compile_ops
+        if use_speculative is not None:
+            overrides["use_speculative"] = use_speculative
+        elif draft_model is not None:
+            overrides["use_speculative"] = True
         if overrides:
             config = replace(config, **overrides)
         if config.max_model_len > model.config.max_pos_embed:
@@ -57,6 +67,8 @@ class LLM:
             fuse = getattr(model, "fuse_weights", None)
             if fuse is not None:
                 fuse()
+        if config.compile_ops:
+            model.enable_compile_ops()
         runner = ModelRunner(
             model.eval(),
             None,
@@ -70,8 +82,16 @@ class LLM:
         )
         runner.allocate_kv_cache(num_blocks)
         scheduler = Scheduler(config, BlockManager(num_blocks, block_size))
+        if speculator is None and draft_model is not None and config.use_speculative:
+            from microinfer.engine.speculative import DraftModelSpeculator
+
+            speculator = DraftModelSpeculator(
+                draft_model,
+                max_drafts=config.speculative_max_drafts,
+                vocab_size=model.config.vocab_size,
+            )
         return cls(
-            LLMEngine(scheduler, runner),
+            LLMEngine(scheduler, runner, speculator=speculator),
             InputProcessor(
                 tokenizer,
                 max_model_len=scheduler.max_length,
@@ -94,6 +114,11 @@ class LLM:
         use_compile=None,
         fuse_weights=True,
         use_cuda_graph=None,
+        compile_ops=None,
+        use_speculative=None,
+        draft_model_path=None,
+        draft_layers=None,
+        draft_num_blocks=None,
     ):
         """Load a local Qwen3 directory. Never downloads or executes remote code."""
         import torch
@@ -117,13 +142,63 @@ class LLM:
             }[dtype]
         if dtype not in (torch.float32, torch.float16, torch.bfloat16):
             raise ValueError("unsupported model dtype")
-        # Construct on the target device, then convert before loading weights.
-        with torch.device(device):
-            model = QwenModel(config).to(dtype=dtype)
+        # Construct directly in the target dtype/device. Building in FP32 and
+        # converting doubles peak memory and OOMs larger checkpoints.
+        previous_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(dtype)
+            with torch.device(device):
+                model = QwenModel(config)
+        finally:
+            torch.set_default_dtype(previous_dtype)
         load_model(model, path)
         tokenizer = AutoTokenizer.from_pretrained(
             path, local_files_only=True, trust_remote_code=False
         )
+        draft_model = None
+        native_speculator = None
+        if draft_model_path is not None:
+            if draft_layers is not None:
+                from microinfer.engine.native_draft import NativeDraftSpeculator
+                from microinfer.model.draft import load_pruned_draft
+
+                draft_model = load_pruned_draft(
+                    draft_model_path,
+                    num_layers=draft_layers,
+                    dtype=dtype,
+                    device=device,
+                )
+                draft_compile_ops = (
+                    compile_ops
+                    if compile_ops is not None
+                    else bool(engine_config and engine_config.compile_ops)
+                )
+                if draft_compile_ops:
+                    draft_model.enable_compile_ops()
+                native_speculator = NativeDraftSpeculator(
+                    draft_model,
+                    block_size=block_size,
+                    num_blocks=draft_num_blocks or num_blocks,
+                    max_drafts=(
+                        engine_config.speculative_max_drafts
+                        if engine_config is not None
+                        else 8
+                    ),
+                    max_num_seqs=(
+                        engine_config.max_num_seqs if engine_config is not None else 8
+                    ),
+                    use_cuda_graph=bool(use_cuda_graph),
+                )
+            else:
+                from transformers import AutoModelForCausalLM
+
+                draft_model = AutoModelForCausalLM.from_pretrained(
+                    draft_model_path,
+                    local_files_only=True,
+                    trust_remote_code=False,
+                    dtype=dtype,
+                )
+                draft_model.to(device)
         return cls.from_model(
             model,
             tokenizer,
@@ -134,6 +209,10 @@ class LLM:
             use_compile=use_compile,
             fuse_weights=fuse_weights,
             use_cuda_graph=use_cuda_graph,
+            compile_ops=compile_ops,
+            use_speculative=use_speculative,
+            draft_model=draft_model,
+            speculator=native_speculator,
         )
 
     def generate(self, prompts, sampling_params=None, use_tqdm=True):

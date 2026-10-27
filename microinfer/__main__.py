@@ -34,6 +34,25 @@ def main():
         help="capture decode buckets with CUDA Graph (mutually exclusive with compile)",
     )
     parser.add_argument(
+        "--compile-ops",
+        action="store_true",
+        help="compile RMSNorm/SwiGLU/RoPE individually (compatible with CUDA Graph)",
+    )
+    parser.add_argument(
+        "--use-speculative",
+        action="store_true",
+        help="enable greedy n-gram speculative decoding",
+    )
+    parser.add_argument(
+        "--draft-model",
+        default=None,
+        help="local causal-LM draft model directory (enables speculative decoding)",
+    )
+    parser.add_argument(
+        "--draft-layers", type=int, default=None, help="use a layer-pruned native draft"
+    )
+    parser.add_argument("--draft-num-blocks", type=int, default=None)
+    parser.add_argument(
         "--model", required=True, help="local safetensors/tokenizer directory"
     )
     parser.add_argument(
@@ -64,6 +83,11 @@ def main():
         use_compile=args.use_compile,
         fuse_weights=args.fuse_weights,
         use_cuda_graph=args.use_cuda_graph,
+        compile_ops=args.compile_ops or None,
+        use_speculative=args.use_speculative or args.draft_model is not None,
+        draft_model_path=args.draft_model,
+        draft_layers=args.draft_layers,
+        draft_num_blocks=args.draft_num_blocks,
     )
     results = llm.generate(
         args.prompt,

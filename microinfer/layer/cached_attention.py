@@ -7,16 +7,11 @@ from torch import nn
 from torch.nn import functional as F
 
 from microinfer.layer.paged_attention import (
+    _index_tensor,
     flash_attn_varlen_func,
     paged_attention_meta,
 )
 from microinfer.worker.kv_cache import LayerKVCache
-
-
-def _as_int32(tensor):
-    if tensor.dtype != torch.int32:
-        tensor = tensor.to(torch.int32)
-    return tensor.contiguous()
 
 
 def _direct_prefill_flash(q, k, v, metadata):
@@ -40,8 +35,8 @@ def _direct_prefill_flash(q, k, v, metadata):
         q,
         k,
         v,
-        cu_seqlens_q=_as_int32(metadata.cu_seqlens_q),
-        cu_seqlens_k=_as_int32(metadata.cu_seqlens_k),
+        cu_seqlens_q=_index_tensor(metadata.cu_seqlens_q),
+        cu_seqlens_k=_index_tensor(metadata.cu_seqlens_k),
         max_seqlen_q=metadata.max_seqlen_q,
         max_seqlen_k=metadata.max_seqlen_k,
         dropout_p=0.0,

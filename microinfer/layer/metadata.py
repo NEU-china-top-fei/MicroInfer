@@ -1,8 +1,8 @@
 """Attention metadata built once per engine step.
 
 Tensors stay on device for kernels. CPU lists are lazy: the flash paths never
-materialize them, while the reference path and no-prefix prefill build them once
-per step instead of once per layer.
+build them, and the reference path or no-prefix prefill builds them once per
+step for all layers.
 """
 
 from __future__ import annotations

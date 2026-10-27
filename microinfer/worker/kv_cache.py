@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import torch
 
+from microinfer.worker.triton_kv_store import HAS_TRITON, store_kv
+
 
 @dataclass(frozen=True)
 class LayerKVCache:
@@ -53,8 +55,29 @@ class LayerKVCache:
         ``blocks``/``offsets`` are precomputed once per step in
         ``AttentionMetadata.slot_indices`` and reused by every layer.
         """
+        if (
+            HAS_TRITON
+            and self.keys.is_cuda
+            and keys.is_cuda
+            and keys.dtype == self.keys.dtype
+            and keys.stride(-1) == 1
+            and keys.stride(-2) == keys.shape[-1]
+            and values.stride(-1) == 1
+            and values.stride(-2) == values.shape[-1]
+        ):
+            store_kv(
+                self.keys,
+                self.values,
+                blocks,
+                offsets,
+                keys,
+                values,
+                self.block_size,
+            )
+            return
         self.keys[blocks, offsets] = keys
         self.values[blocks, offsets] = values
+
 
 class KVCache:
     def __init__(

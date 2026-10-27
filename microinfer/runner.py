@@ -49,12 +49,13 @@ class _DecodeBuffers:
 
 
 class _GraphBucket:
-    def __init__(self, batch, buffers, metadata, graph, logits):
+    def __init__(self, batch, buffers, metadata, graph, logits, tokens):
         self.batch = batch
         self.buffers = buffers
         self.metadata = metadata
         self.graph = graph
         self.logits = logits
+        self.tokens = tokens
 
 
 class ModelRunner:
@@ -135,7 +136,7 @@ class ModelRunner:
         config = self.model.config
         weight = self.model.embedding.weight
         # One extra block is never handed to the scheduler; padded graph rows
-        # write their KV there instead of corrupting a live request.
+        # write their KV there, never into a live request's block.
         extra = 1 if self.use_cuda_graph else 0
         self._pad_block_id = num_blocks if self.use_cuda_graph else None
         cache = KVCache(
@@ -155,6 +156,25 @@ class ModelRunner:
     def _decode_forward(self, input_ids, positions, metadata):
         hidden = self._forward(input_ids, positions, metadata)
         return self.model.compute_logits(hidden, metadata)
+
+    def _fill_decode_rows(self, buffers: "_DecodeBuffers", seqs, rows=None):
+        """Fill the CPU staging rows shared by eager and graph decode."""
+        cpu = buffers.cpu
+        block_tables = cpu["block_tables"]
+        count = len(seqs) if rows is None else rows
+        block_tables[:count].fill_(-1)
+        for index, seq in enumerate(seqs):
+            position = len(seq) - 1
+            cpu["input_ids"][index] = seq.last_token
+            cpu["positions"][index] = position
+            cpu["slot_mapping"][index] = (
+                seq.block_table[position // self.block_size] * self.block_size
+                + position % self.block_size
+            )
+            cpu["context_lens"][index] = len(seq)
+            block_tables[index, : len(seq.block_table)] = torch.tensor(
+                seq.block_table, dtype=torch.int32
+            )
 
     @staticmethod
     def _copy_decode_buffers(buffers: "_DecodeBuffers", batch: int):
@@ -215,11 +235,14 @@ class ModelRunner:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, self._graph_pool), torch.inference_mode():
             logits = self._decode_forward(input_ids, positions, capture_metadata)
+            # Greedy sampling is part of the graph: replay no longer launches
+            # an argmax kernel at the Python boundary.
+            tokens = logits.argmax(-1)
         if self._graph_pool is None:
             self._graph_pool = graph.pool()
         torch.cuda.synchronize(device)
         self._graph_buckets.append(
-            _GraphBucket(batch, buffers, capture_metadata, graph, logits)
+            _GraphBucket(batch, buffers, capture_metadata, graph, logits, tokens)
         )
 
     def capture_cuda_graphs(self):
@@ -334,20 +357,8 @@ class ModelRunner:
         buffers.ensure(batch, width)
 
         cpu = buffers.cpu
+        self._fill_decode_rows(buffers, seqs)
         block_cpu = cpu["block_tables"]
-        block_cpu[:batch].fill_(-1)
-        for i, seq in enumerate(seqs):
-            position = len(seq) - 1
-            cpu["input_ids"][i] = seq.last_token
-            cpu["positions"][i] = position
-            cpu["slot_mapping"][i] = (
-                seq.block_table[position // self.block_size] * self.block_size
-                + position % self.block_size
-            )
-            cpu["context_lens"][i] = len(seq)
-            block_cpu[i, : len(seq.block_table)] = torch.tensor(
-                seq.block_table, dtype=torch.int32
-            )
 
         non_blocking = buffers.pin_memory
         device_tensors = buffers.device_tensors
@@ -530,6 +541,17 @@ class ModelRunner:
         hidden = self._forward_for(is_prefill)(input_ids, positions, metadata)
         return self.model.compute_logits(hidden, metadata)
 
+    @torch.inference_mode()
+    def run_verify(self, seqs):
+        """Run a speculative verification batch and return every query logit.
+
+        Verification uses the prefill layout (query lengths are 1 + drafts) and
+        skips `compute_logits`, which keeps only the last query of each request.
+        """
+        input_ids, positions, metadata = self.prepare_prefill(seqs)
+        hidden = self._forward(input_ids, positions, metadata)
+        return metadata, self.model.out_logits(hidden)
+
     def _select_graph_bucket(self, batch: int):
         for bucket in self._graph_buckets:
             if bucket.batch >= batch:
@@ -542,20 +564,7 @@ class ModelRunner:
         assert self._pad_block_id is not None
         cpu = bucket.buffers.cpu
         block_tables = cpu["block_tables"]
-        block_tables.fill_(-1)
-
-        for i, seq in enumerate(seqs):
-            position = len(seq) - 1
-            cpu["input_ids"][i] = seq.last_token
-            cpu["positions"][i] = position
-            cpu["context_lens"][i] = len(seq)
-            cpu["slot_mapping"][i] = (
-                seq.block_table[position // self.block_size] * self.block_size
-                + position % self.block_size
-            )
-            block_tables[i, : len(seq.block_table)] = torch.tensor(
-                seq.block_table, dtype=torch.int32
-            )
+        self._fill_decode_rows(bucket.buffers, seqs, rows=capacity)
 
         for i in range(batch, capacity):
             cpu["input_ids"][i] = 0
@@ -590,23 +599,24 @@ class ModelRunner:
                         False,
                     )
                 bucket.graph.replay()
-                return bucket.logits[: len(seqs)]
+                return bucket.logits[: len(seqs)], bucket.tokens[: len(seqs)]
         ids, positions, metadata = self.prepare_decode(seqs)
-        return self.run_model(ids, positions, False, metadata)
+        return self.run_model(ids, positions, False, metadata), None
 
     @torch.inference_mode()
     def run(self, seqs, is_prefill):
         if not seqs:
             return []
         self.model.eval()
+        decode_tokens = None
         if is_prefill:
             ids, positions, metadata = self.prepare_prefill(seqs)
             logits = self.run_model(ids, positions, True, metadata)
         else:
-            logits = self._run_decode(seqs)
+            logits, decode_tokens = self._run_decode(seqs)
         greedy_flags = [s.greedy for s in seqs]
         if all(greedy_flags):
-            tokens = logits.argmax(-1)
+            tokens = logits.argmax(-1) if decode_tokens is None else decode_tokens
         elif not any(greedy_flags):
             tokens = self.sampler(logits, self.prepare_sample(seqs))
         else:

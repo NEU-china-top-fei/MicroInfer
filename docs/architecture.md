@@ -34,6 +34,7 @@ AsyncEngine._run_loop → LLMEngine.step_events → StreamEvent
 | --- | --- |
 | Scheduler | decode 优先的混合调度、chunk 上限、round-robin、抢占 |
 | AsyncEngine | 异步准入、step task、流式队列、取消与背压 |
+| NgramSpeculator / DraftModelSpeculator / NativeDraftSpeculator | n-gram、HF draft、层裁剪 paged/Graph draft |
 | serve | OpenAI 兼容 HTTP/SSE 与 Prometheus metrics |
 | detokenizer | 累计 decode + UTF-8 stable-text buffer |
 | Sequence | token 历史、已计算长度、采样参数、finish reason 和请求状态 |
@@ -80,10 +81,12 @@ Runner 持有 `KVCache.keys/values: [layers, blocks, B, Hkv, D]`。
 LayerKVCache 有两个写入入口：`write_checked` 支持 `-1` padding，并在写入前验证形状、
 范围和重复 slot；`write_fast` 接收 `AttentionMetadata.slot_indices` 预计算好的
 `blocks/offsets`，不做 host 校验。生产 decode 走 `write_fast`，
-`debug_mode=True` 时走 `write_checked`。
+`debug_mode=True` 时走 `write_checked`。CUDA 上 `write_fast` 优先用
+`microinfer/worker/triton_kv_store.py` 的 scatter kernel；内层布局不满足时回退
+advanced indexing。
 BlockManager 管引用计数，释放块不清零张量。计算只读取有效块表与 context lengths 指定的数据。
 P4 的 free list 是 lazy LRU heap，lookup 命中会刷新 recency；`block_id_to_hashes`
-反向索引让复用块时只删除自己的 hash，而不是扫描整张表。命中/淘汰 token 数通过
+反向索引让复用块时只删除自己的 hash，无需扫描整张表。命中/淘汰 token 数通过
 `BlockManager.stats()` 暴露。
 
 Runner 每步构建一次 `AttentionMetadata`，包含 slot、位置、`cu_seqlens_q/k`、
@@ -129,8 +132,15 @@ dense 路径不改动 KV 池，packed 路径通过 `AttentionMetadata` 读写本
   分页 kernel；否则用 `triton_paged_attention.triton_paged_decode`（任意 2 的幂
   block size，FP16/BF16/FP32，FP32 online softmax）。Triton 不可用或形状不满足
   时才回到参考实现。
-- 小 block 的 prefill 用 `_gather_paged_kv` 把每个请求的有效 K/V 从物理块
-  gather 成连续 `[total_k, Hkv, D]`，再调用一次 `flash_attn_varlen_func`；
+- Triton decode 在 `(request, head)` 并行度不足 64 个 program 时自动启用
+  `split_k=4`：每个 program 以 stride 方式扫描一部分 context，第二个 kernel 用
+  online-softmax 状态合并。split 数是 capture 期间的常量，因此 CUDA Graph replay
+  仍可用；batch 足够大时走单 split 直接写出，不分配 workspace。
+- 小 block 的 prefill 优先用 `triton_paged_prefill` 直接读 paged cache：每个
+  program 计算 `BLOCK_M x head` 个 query 对全部 cached key 的 causal attention。
+  它消除了逐层 `_gather_paged_kv` 的 `index_select+cat`（共享前缀场景每个
+  prefill step 约 400 次小拷贝）。当 query 数量与 context 同量级时（如 2K 全量
+  prompt），仍用 gather + `flash_attn_varlen_func`，因为 FA 在长 prefill 上更快；
   大 block 继续使用带 `block_table` 的 paged varlen 路径。
 - 分页参考后端的 FP16/BF16 输入在 FP32 中计算 QK、softmax、PV，输出转回输入 dtype。
 - 满足设备、dtype、head dimension 和块大小约束时，可调用 FlashAttention 分页后端。
@@ -149,6 +159,13 @@ FlashAttention 的 pybind op 仍是 opaque custom kernel 边界，compile 会在
 P3 的 Triton paged decode 是普通 Triton launch，Dynamo 可以完整追踪：`block_size=16`
 时 decode 编译成单图，`block_size=256` 的 FA 路径仍会产生多次 graph break。
 
+`compile_ops=True` 是另一条路径：RMSNorm+residual、SwiGLU、RoPE 分别
+`torch.compile(dynamic=True)`，不编译整个 forward，因此可以与 CUDA Graph 共存。
+prefill 还把 Q/K 的 RMSNorm 与 RoPE 合并成一个编译区域
+（`_compiled_qk_norm_rope`），把每层 4 次小 launch 收成一次；decode 仍走 graph
+内的独立算子。它对 target 和 native draft 都生效；`use_compile`（全图编译）与它
+互斥。
+
 decode 的 metadata 使用 `_DecodeBuffers`：pinned CPU staging + 复用 device buffer，
 每个 step 原地填充 `input_ids/positions/slot_mapping/context_lens/block_tables`，
 再 `copy_(non_blocking=True)`。这去掉了每步 `torch.tensor(list, device="cuda")`
@@ -161,7 +178,8 @@ decode 的 metadata 使用 `_DecodeBuffers`：pinned CPU staging + 复用 device
 - 每个 bucket 有固定的 `_DecodeBuffers` 和 logits 输出 buffer；
 - capture 使用全新的 `AttentionMetadata`，使 `slot_indices()` 的
   `long/div/mod` kernel 进入图内，replay 时根据新 slot 重新计算；
-- `graph.replay()` 后只取真实 batch 的 logits，再 argmax/sample。
+- greedy 的 `argmax` 也在 capture 内，replay 后直接取 token，不再多一次
+  Python 边界上的 kernel launch；非 greedy 请求仍使用 logits 采样。
 
 CUDA Graph 只用于 decode，prefill 仍 eager；它与 `use_compile` 互斥。decode 可以走
 FlashAttention 分页 kernel（`block_size % 256 == 0`），也可以走 Triton 小 block
@@ -169,6 +187,23 @@ kernel；两者都在 graph 前完成 JIT/allocator warmup。唯一的架构性�
 `tokens.tolist()`。`Sampler` 的 logits 有限性校验只在 `debug_mode=True` 时执行。
 详细设计与结果见 [P2 文档](p2.md) 和 [P3 文档](p3.md)；两种优化的原理和排查方法见
 [torch.compile 与 CUDA Graph](compile-and-cuda-graph.md)。
+
+### 投机解码
+
+- `NgramSpeculator` 从 prompt 和已生成 token 中查找重复 n-gram，不需要额外模型；
+- `DraftModelSpeculator` 用独立的 HF causal LM 和 per-sequence 增量 KV cache
+  提议 draft；
+- `NativeDraftSpeculator` 把层裁剪的 Qwen 模型放进第二个 `ModelRunner`，复用
+  paged KV、packed weights、Triton decode 和 CUDA Graph，并批量处理多个请求的
+  draft 提议。
+
+三种 proposer 由 `--draft-model` / `--draft-layers` 或默认 n-gram 启用。
+`LLMEngine._speculative_step` 仅在 no-waiting、全 greedy、有 draft 且 KV 足够时
+启用：把 draft 临时追加到 token 序列，`Runner.run_verify` 用 packed prefill 返回
+所有 query logits；只保留最长接受前缀，然后调用普通 scheduler decode 生成下一个
+token。verify 只决定 draft 是否保留，输出 token 仍由 decode kernel 产生，保持 greedy
+一致性。被拒绝的 draft 通过截断 token_ids、恢复 `num_cached_tokens` 和
+`BlockManager.trim` 回收。详细设计见 [P5 文档](p5.md)。
 
 ### 异步与服务
 

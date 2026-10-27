@@ -33,6 +33,13 @@ class QwenModel(nn.Module):
             layer.attention.fuse_weights()
             layer.ffn.fuse_weights()
 
+    def enable_compile_ops(self):
+        """Compile RMSNorm/SwiGLU/RoPE individually (nano-vllm style)."""
+        self.rotary.compile_ops = True
+        for module in self.modules():
+            if hasattr(module, "compile_ops"):
+                module.compile_ops = True
+
     def forward(self, x, position, metadata=None):
         if x.ndim == 1 and metadata is None:
             raise ValueError("packed input requires AttentionMetadata")

@@ -25,6 +25,13 @@ def main():
     parser.add_argument("--use-cuda-graph", action="store_true")
     parser.add_argument("--no-fuse-weights", action="store_true")
     parser.add_argument("--no-mixed-batch", action="store_true")
+    parser.add_argument("--compile-ops", action="store_true")
+    parser.add_argument("--use-speculative", action="store_true")
+    parser.add_argument("--draft-model", default=None)
+    parser.add_argument(
+        "--draft-layers", type=int, default=None, help="use a layer-pruned native draft"
+    )
+    parser.add_argument("--draft-num-blocks", type=int, default=None)
     args = parser.parse_args()
 
     try:
@@ -54,6 +61,7 @@ def main():
         max_num_prefill_tokens=args.max_num_prefill_tokens,
         max_model_len=max_model_len,
         mixed_batch=not args.no_mixed_batch,
+        use_speculative=args.use_speculative,
     )
     llm = LLM.from_pretrained(
         model_path,
@@ -64,6 +72,11 @@ def main():
         engine_config=engine_config,
         use_compile=args.use_compile,
         use_cuda_graph=args.use_cuda_graph,
+        compile_ops=args.compile_ops or None,
+        use_speculative=args.use_speculative or args.draft_model is not None,
+        draft_model_path=args.draft_model,
+        draft_layers=args.draft_layers,
+        draft_num_blocks=args.draft_num_blocks,
         fuse_weights=not args.no_fuse_weights,
     )
     app = create_app(

@@ -37,7 +37,12 @@ class MicroInferEngine:
         use_compile=False,
         fuse_weights=True,
         use_cuda_graph=False,
+        compile_ops=False,
         mixed_batch=True,
+        use_speculative=False,
+        draft_model_path=None,
+        draft_layers=None,
+        draft_num_blocks=None,
     ):
         if cache_mode not in ("cold", "warm"):
             raise ValueError("cache_mode must be cold or warm")
@@ -48,6 +53,11 @@ class MicroInferEngine:
         self.use_compile = use_compile
         self.fuse_weights = fuse_weights
         self.use_cuda_graph = use_cuda_graph
+        self.compile_ops = compile_ops
+        self.use_speculative = use_speculative
+        self.draft_model_path = draft_model_path
+        self.draft_layers = draft_layers
+        self.draft_num_blocks = draft_num_blocks
         self.cache_mode = cache_mode
         self.device = torch.device(device)
         self.dtype = dtype
@@ -71,6 +81,7 @@ class MicroInferEngine:
             max_num_prefill_tokens=self.max_num_prefill_tokens,
             max_model_len=self.max_model_len,
             mixed_batch=self.mixed_batch,
+            use_speculative=self.use_speculative,
         )
         self.llm = LLM.from_pretrained(
             self.model_path,
@@ -83,6 +94,11 @@ class MicroInferEngine:
             use_compile=self.use_compile,
             fuse_weights=self.fuse_weights,
             use_cuda_graph=self.use_cuda_graph,
+            compile_ops=self.compile_ops or None,
+            use_speculative=self.use_speculative or self.draft_model_path is not None,
+            draft_model_path=self.draft_model_path,
+            draft_layers=self.draft_layers,
+            draft_num_blocks=self.draft_num_blocks,
         )
         cache = self.llm.engine.model_runner.kv_cache
         from microinfer.layer.paged_attention import (
@@ -115,13 +131,21 @@ class MicroInferEngine:
             "prefill_backend": (
                 "flash-paged"
                 if flash_paged
-                else ("gather-varlen" if flash_attn_varlen_func else "reference")
+                else (
+                    "triton-paged+gather-varlen"
+                    if HAS_TRITON and flash_attn_varlen_func
+                    else ("gather-varlen" if flash_attn_varlen_func else "reference")
+                )
             ),
             "cache_mode": self.cache_mode,
             "debug_mode": self.debug_mode,
             "use_compile": self.use_compile,
             "fuse_weights": self.fuse_weights,
             "use_cuda_graph": self.use_cuda_graph,
+            "compile_ops": self.compile_ops,
+            "use_speculative": self.use_speculative,
+            "draft_model": self.draft_model_path,
+            "draft_layers": self.draft_layers,
         }
         return self
 

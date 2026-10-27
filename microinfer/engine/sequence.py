@@ -34,6 +34,9 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
         self.greedy = sampling_params.greedy
         self.finish_reason: str | None = None
+        # P5 speculative verification state; empty for normal decode.
+        self.spec_draft_ids: tuple[int, ...] = ()
+        self.spec_base_len = 0
 
     def __len__(self):
         return self.num_tokens

@@ -210,6 +210,15 @@ class BlockManager:
                 self._deallocate_block(block_id)
         seq.block_table.clear()
 
+    def trim(self, seq: Sequence):
+        """Release blocks beyond the sequence's current logical length."""
+        while len(seq.block_table) > seq.num_blocks:
+            block_id = seq.block_table.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= max(0, seq.num_blocks - len(seq.block_table))
 
